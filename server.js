@@ -9,7 +9,7 @@ const app = express();
 app.use(express.json({ limit: "50mb" }));
 
 // Optional simple auth via header X-Token
-const API_TOKEN = process.env.API_TOKEN || null;
+const API_TOKEN = process.env.API_TOKEN || "Dsl8UTgQ3fJFR7zrjXOAKhtxBZ2cmWVSM9ECuP5Ne1kap6qH";
 app.use((req, res, next) => {
   if (!API_TOKEN) return next();
   if (req.header("x-token") === API_TOKEN) return next();
