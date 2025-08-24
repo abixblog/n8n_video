@@ -29,10 +29,10 @@ app.post("/render", async (req, res) => {
   // Filtro de video (espejo + zoom + rotación + contraste)
   const filters = [
     "hflip",
-    "scale=iw*1.05:ih*1.05",
+    "scale=iw*1.10:ih*1.10",
     "crop=iw:ih",
     "rotate=3*PI/180",
-    "eq=contrast=1.08"
+    "eq=contrast=1.10"
   ].join(",");
 
   // Construye args de ffmpeg
