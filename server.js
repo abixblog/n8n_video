@@ -6,6 +6,36 @@ import fetch from "node-fetch";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+app.post("/frames", async (req, res) => {
+  try {
+    const { video_url, every_sec = 6, max_frames = 20, scale = 1080 } = req.body;
+    const inFile = join(tmpdir(), "in.mp4");
+    const r = await fetch(video_url);
+    if (!r.ok) return res.status(400).json({ error: "fetch video failed" });
+    await writeFile(inFile, Buffer.from(await r.arrayBuffer()));
+
+    const outPattern = join(tmpdir(), "f-%03d.jpg");
+    const vf = `fps=1/${every_sec},scale=${scale}:-2`;
+    await sh("ffmpeg", ["-y", "-i", inFile, "-vf", vf, "-frames:v", String(max_frames), outPattern]);
+
+    const frames = [];
+    for (let i = 1; i <= max_frames; i++) {
+      const p = outPattern.replace("%03d", String(i).padStart(3, "0"));
+      try {
+        const buf = await readFile(p);
+        frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
+        await rm(p);
+      } catch {
+        break;
+      }
+    }
+    await rm(inFile);
+    res.json({ frames });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 app.post("/render", async (req, res) => {
   const { video_url, audio_url, loop_video = true } = req.body || {};
   if (!video_url || !audio_url) {
