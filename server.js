@@ -1,38 +1,56 @@
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { createWriteStream, createReadStream } from "node:fs";
-import { writeFile, rm } from "node:fs/promises";
+import { createWriteStream, readFile, rm } from "node:fs/promises";
 import fetch from "node-fetch";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 app.post("/frames", async (req, res) => {
-  try {
-    const { video_url, every_sec = 6, max_frames = 20, scale = 1080 } = req.body;
-    const inFile = join(tmpdir(), "in.mp4");
-    const r = await fetch(video_url);
-    if (!r.ok) return res.status(400).json({ error: "fetch video failed" });
-    await writeFile(inFile, Buffer.from(await r.arrayBuffer()));
+  if (RUNNING >= MAX_RUNNING) return res.status(503).json({ error: "busy" });
+  RUNNING++;
 
-    const outPattern = join(tmpdir(), "f-%03d.jpg");
-    const vf = `fps=1/${every_sec},scale=${scale}:-2`;
-    await sh("ffmpeg", ["-y", "-i", inFile, "-vf", vf, "-frames:v", String(max_frames), outPattern]);
+  try {
+    const { video_url, every_sec = 6, max_frames = 10, scale = 720, times } = req.body || {};
+    if (!video_url) return res.status(400).json({ error: "video_url required" });
+
+    // descarga por streaming
+    const inFile = join(tmpdir(), `in_${Date.now()}.mp4`);
+    const r = await fetch(video_url);
+    if (!r.ok) return res.status(400).json({ error: "fetch video failed", status: r.status });
+    await pipeline(Readable.fromWeb(r.body), createWriteStream(inFile));
 
     const frames = [];
-    for (let i = 1; i <= max_frames; i++) {
-      const p = outPattern.replace("%03d", String(i).padStart(3, "0"));
-      try {
-        const buf = await readFile(p);
+
+    if (Array.isArray(times) && times.length) {
+      // modo preciso: un -ss por cada tiempo (más liviano para videos largos)
+      for (const t of times.slice(0, max_frames)) {
+        const out = join(tmpdir(), `f_${t}.jpg`);
+        await sh("ffmpeg", ["-y", "-ss", String(t), "-i", inFile, "-frames:v", "1", "-vf", `scale=${scale}:-2`, out]);
+        const buf = await readFile(out);
         frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
-        await rm(p);
-      } catch {
-        break;
+        await rm(out, { force: true });
+      }
+    } else {
+      // modo simple: fps=1/every_sec
+      const outPattern = join(tmpdir(), "f-%03d.jpg");
+      await sh("ffmpeg", ["-y", "-i", inFile, "-vf", `fps=1/${every_sec},scale=${scale}:-2`, "-frames:v", String(max_frames), outPattern]);
+      for (let i = 1; i <= max_frames; i++) {
+        const p = outPattern.replace("%03d", String(i).padStart(3, "0"));
+        try {
+          const buf = await readFile(p);
+          frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
+          await rm(p, { force: true });
+        } catch { break; }
       }
     }
-    await rm(inFile);
-    res.json({ frames });
+
+    await rm(inFile, { force: true });
+    res.json({ frames, count: frames.length });
   } catch (err) {
     res.status(500).json({ error: String(err) });
+  } finally {
+    RUNNING--;
   }
 });
 
