@@ -242,15 +242,15 @@ app.post("/render", async (req, res) => {
   try {
     // Descargas con timeout y retry
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 60000, retries: 1 });
-    await pipeline(Readable.fromWeb(vres.body), createWriteStream(inV));
+    await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 60000, retries: 1 });
-    await pipeline(Readable.fromWeb(ares.body), createWriteStream(inA));
+    await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 30000, retries: 1 });
-      await pipeline(Readable.fromWeb(s.body), createWriteStream(srtPath));
+      await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
     // ==== Construcción dinámica del filtro de video ====
