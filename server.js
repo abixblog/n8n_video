@@ -12,6 +12,14 @@ import fetch from "node-fetch"; // (Node 20 ya trae fetch, pero lo dejamos por c
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+function toNodeReadable(body) {
+  if (!body) throw new Error("empty body");
+  // Si ya es Node stream (tiene .pipe), úsalo tal cual:
+  if (typeof body.pipe === "function") return body;
+  // Si es Web ReadableStream, conviértelo:
+  return Readable.fromWeb(body);
+}
+
 const execFileP = promisify(execFile);
 
 // ---------------- utilidades básicas ----------------
@@ -126,7 +134,7 @@ app.post("/frames", async (req, res) => {
       // descarga
       const inFile = join(tmpdir(), `in_${Date.now()}.mp4`);
       const r = await fetchWithTimeout(video_url, { timeoutMs: 30000, retries: 1 });
-      await pipeline(Readable.fromWeb(r.body), createWriteStream(inFile));
+      await pipeline(toNodeReadable(r.body), createWriteStream(inFile));
 
       // si el video es menor que "scale", no lo fuerces
       const src = await probeSize(inFile);
