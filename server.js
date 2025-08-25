@@ -219,8 +219,6 @@ app.post('/frames', async (req, res) => {
   });
 });
 
-// ---------------- /render (configurable) ----------------
-// ---------------- /render (configurable, sin errores) ----------------
 app.post("/render", async (req, res) => {
   const b = req.body || {};
 
@@ -265,6 +263,48 @@ app.post("/render", async (req, res) => {
   let srtPath = null;
   let finished = false;
 
+  // helper para construir el filtro final con estrategia "cover" o "pad"
+  const buildFilters = (mode /* "cover" | "pad" */) => {
+    const vf = [];
+    if (mirror) vf.push("hflip");
+    if (vflip)  vf.push("vflip");
+    if (zoom_factor !== 1) vf.push(`scale=iw*${zoom_factor}:ih*${zoom_factor}`);
+    vf.push("crop=iw:ih"); // dummy para mantener canvas tras zoom
+    if (rotate_deg) vf.push(`rotate=${rotate_deg}*PI/180`);
+
+    // color
+    const sat = grayscale ? 0 : saturation;
+    const eqParams = [];
+    if (contrast   !== 1) eqParams.push(`contrast=${contrast.toFixed(2)}`);
+    if (brightness !== 0) eqParams.push(`brightness=${brightness.toFixed(2)}`);
+    if (sat        !== 1) eqParams.push(`saturation=${sat.toFixed(2)}`);
+    if (gamma      !== 1) eqParams.push(`gamma=${gamma.toFixed(2)}`);
+    if (eqParams.length)  vf.push(`eq=${eqParams.join(":")}`);
+
+    if (blur    > 0) vf.push(`gblur=sigma=${blur.toFixed(2)}`);
+    if (sharpen > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${sharpen.toFixed(2)}`);
+
+    // Normaliza SAR y encaja al canvas
+    vf.push("setsar=1");
+
+    if (mode === "cover") {
+      // Escalar para cubrir y recortar exacto
+      vf.push(`scale=${target_width}:${target_height}:force_original_aspect_ratio=increase`);
+      vf.push(`crop=${target_width}:${target_height}`);
+    } else {
+      // Letterbox: encajar sin recortar y rellenar con pad centrado
+      vf.push(`scale=${target_width}:${target_height}:force_original_aspect_ratio=decrease`);
+      vf.push(`pad=${target_width}:${target_height}:(ow-iw)/2:(oh-ih)/2`);
+    }
+
+    if (srtPath) {
+      const style = "FontName=DejaVu Sans,Fontsize=36,BorderStyle=3,Outline=2,Shadow=0,PrimaryColour=&H00FFFFFF&,OutlineColour=&H80000000&,MarginV=48,Alignment=2";
+      vf.push(`subtitles='${srtPath.replace(/\\/g, "/")}':force_style='${style}'`);
+    }
+
+    return vf.join(",");
+  };
+
   try {
     // Descargas con timeout y retry (y stream compatible Node/Web)
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 60000, retries: 1 });
@@ -279,65 +319,9 @@ app.post("/render", async (req, res) => {
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
-    // ==== Construcción dinámica del filtro de video ====
-    const vf = [];
-
-    // flips
-    if (mirror) vf.push("hflip");
-    if (vflip)  vf.push("vflip");
-
-    // zoom (antes de rotar)
-    if (zoom_factor !== 1) vf.push(`scale=iw*${zoom_factor}:ih*${zoom_factor}`);
-    // crop dummy para mantener canvas tras zoom (sin cambiar proporciones)
-    vf.push("crop=iw:ih");
-
-    // rotación
-    if (rotate_deg) vf.push(`rotate=${rotate_deg}*PI/180`);
-
-    // color
-    const sat = grayscale ? 0 : saturation;
-    const eqParams = [];
-    if (contrast   !== 1) eqParams.push(`contrast=${contrast.toFixed(2)}`);
-    if (brightness !== 0) eqParams.push(`brightness=${brightness.toFixed(2)}`);
-    if (sat        !== 1) eqParams.push(`saturation=${sat.toFixed(2)}`);
-    if (gamma      !== 1) eqParams.push(`gamma=${gamma.toFixed(2)}`);
-    if (eqParams.length)  vf.push(`eq=${eqParams.join(":")}`);
-
-    // blur / sharpen
-    if (blur    > 0) vf.push(`gblur=sigma=${blur.toFixed(2)}`);
-    if (sharpen > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${sharpen.toFixed(2)}`);
-
-    // === COVER sin usar force_original_aspect_ratio ni expresiones if() en ffmpeg ===
-    const srcProbe = await probeSize(inV);
-    const tarAR = target_width / target_height; // p.ej., 1080/1920 = 0.5625
-    let scaleCover = `scale=${target_width}:${target_height}`; // fallback si falla probe
-
-    if (srcProbe.width > 0 && srcProbe.height > 0) {
-      const srcAR = srcProbe.width / srcProbe.height;
-      if (srcAR >= tarAR) {
-        // video más ancho: ajusta por alto (altura fija), ancho auto (-2)
-        scaleCover = `scale=-2:${target_height}`;
-      } else {
-        // video más alto/estrecho: ajusta por ancho (ancho fijo), alto auto (-2)
-        scaleCover = `scale=${target_width}:-2`;
-      }
-    }
-
-    // Aplica cover y recorte exacto al canvas final
-    vf.push(scaleCover);
-    vf.push(`crop=${target_width}:${target_height}`);
-
-    // subtítulos embebidos (si hay)
-    if (srtPath) {
-      // Requiere fuente instalada (Dockerfile: fonts-dejavu-core)
-      const style = "FontName=DejaVu Sans,Fontsize=36,BorderStyle=3,Outline=2,Shadow=0,PrimaryColour=&H00FFFFFF&,OutlineColour=&H80000000&,MarginV=48,Alignment=2";
-      vf.push(`subtitles='${srtPath.replace(/\\/g, "/")}':force_style='${style}'`);
-    }
-
-    const filters = vf.join(",");
-
-    // ==== FFmpeg args (audio_gain opcional) ====
-    const args = ["-y"];
+    // 1º intento: COVER (crop centrado)
+    let filters = buildFilters("cover");
+    let args = ["-y"];
     if (loop_video) args.push("-stream_loop", "-1");
     args.push(
       "-i", inV, "-i", inA,
@@ -354,7 +338,35 @@ app.post("/render", async (req, res) => {
       out
     );
 
-    await sh("ffmpeg", args);
+    try {
+      await sh("ffmpeg", args);
+    } catch (e) {
+      // 2º intento automático: LETTERBOX (pad centrado)
+      const msg = (e?.stderr || e?.stdout || e?.message || "").toString();
+      // Si falla por crop/tamaño, reintenta con pad
+      if (/crop|Invalid too big|Error initializing filter 'scale'|Failed to inject frame/i.test(msg)) {
+        filters = buildFilters("pad");
+        args = ["-y"];
+        if (loop_video) args.push("-stream_loop", "-1");
+        args.push(
+          "-i", inV, "-i", inA,
+          "-v", "error",
+          "-filter:v", filters,
+          "-map", "0:v:0", "-map", "1:a:0",
+          "-shortest",
+          ...(audio_gain !== 1 ? ["-filter:a", `volume=${audio_gain}`] : []),
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+          "-c:a", "aac", "-b:a", "192k",
+          "-pix_fmt", "yuv420p",
+          "-movflags", "+faststart",
+          "-threads", String(process.env.FFMPEG_THREADS || 1),
+          out
+        );
+        await sh("ffmpeg", args);
+      } else {
+        throw e;
+      }
+    }
 
     // respuesta en streaming (sin cargar a memoria)
     res.setHeader("Content-Type", "video/mp4");
