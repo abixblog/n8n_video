@@ -76,6 +76,22 @@ function assertContentType(res, allowed, label) {
   }
 }
 
+// Devuelve duración en segundos (float). 0 si falla.
+async function probeDuration(filePath) {
+  try {
+    const { stdout } = await sh("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      filePath
+    ]);
+    const d = parseFloat(String(stdout).trim());
+    return Number.isFinite(d) ? d : 0;
+  } catch {
+    return 0;
+  }
+}
+
 // =========================
 // App
 // =========================
@@ -87,45 +103,99 @@ app.use(express.json({ limit: "20mb" }));
 // -------- /frames (estático) --------
 // Body: { video_url }
 // Devuelve: { frames: [dataURL...], count, src }
+// -------- /frames (DINÁMICO por duración) --------
+// Body: { video_url, every_sec?, max_frames?, scale?, jpg_quality? }
+// Devuelve: { frames: [dataURL...], count }
 app.post("/frames", async (req, res) => {
   try {
-    const { video_url } = req.body || {};
+    const {
+      video_url,
+      every_sec,
+      max_frames,
+      scale,
+      jpg_quality
+    } = req.body || {};
+
     if (!video_url) return res.status(400).json({ error: "video_url required" });
 
-    // Descarga del video (streaming)
+    // Defaults (puedes ajustar estos valores por defecto si quieres)
+    const EVERY_SEC   = Math.max(1, Number(every_sec  ?? 6));
+    const MAX_FRAMES  = Math.max(1, Math.min(50, Number(max_frames ?? 10)));
+    const SCALE_W     = Math.max(240, Math.min(2160, Number(scale      ?? 1080)));
+    const JPG_QUALITY = Math.max(2,   Math.min(7,    Number(jpg_quality ?? 3)));
+    const THREADS     = Number(process.env.FFMPEG_THREADS || 1);
+
+    // 1) Descarga del video (streaming)
     const inFile = join(tmpdir(), `in_${Date.now()}.mp4`);
     const r = await fetchWithTimeout(video_url, { timeoutMs: 60000 });
     if (!r.ok) return res.status(400).json({ error: `fetch video failed`, status: r.status });
     assertContentType(r, ["video", "mp4", "octet-stream"], "video_url");
     await pipeline(toNodeReadable(r.body), createWriteStream(inFile));
 
-    // Extrae frames
-    const outPattern = join(tmpdir(), `f_${Date.now()}-%03d.jpg`);
-    await sh("ffmpeg", [
-      "-y",
-      "-v", "error",
-      "-i", inFile,
-      "-vf", `fps=1/${FRAMES_EVERY_SEC},scale=${FRAMES_SCALE_W}:-2:flags=lanczos`,
-      "-frames:v", String(FRAMES_MAX),
-      "-q:v", String(JPG_QUALITY),
-      "-threads", String(THREADS),
-      outPattern
-    ]);
+    // 2) Duración con ffprobe
+    const dur = await probeDuration(inFile);
 
-    const frames = [];
-    for (let i = 1; i <= FRAMES_MAX; i++) {
-      const p = outPattern.replace("%03d", String(i).padStart(3, "0"));
-      try {
-        const buf = await readFile(p);
-        frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
-        await rm(p, { force: true });
-      } catch {
-        break;
+    // 3) Construye los tiempos dinámicos
+    let times = [];
+    if (dur > 0) {
+      // tiempos: EVERY_SEC, 2*EVERY_SEC, ... <= dur
+      for (let t = EVERY_SEC; t <= dur; t += EVERY_SEC) {
+        times.push(+t.toFixed(3));
+        if (times.length >= MAX_FRAMES) break;
       }
+      // Si el video es corto y no se alcanzó ningún múltiplo, toma 1 frame al medio:
+      if (times.length === 0) {
+        times = [+(Math.max(0, dur / 2).toFixed(3))];
+      }
+    } else {
+      // Fallback: si no tenemos duración, extraemos con fps como antes
+      const outPattern = join(tmpdir(), `f_${Date.now()}-%03d.jpg`);
+      await sh("ffmpeg", [
+        "-y", "-v", "error",
+        "-i", inFile,
+        "-vf", `fps=1/${EVERY_SEC},scale=${SCALE_W}:-2:flags=lanczos`,
+        "-frames:v", String(MAX_FRAMES),
+        "-q:v", String(JPG_QUALITY),
+        "-threads", String(THREADS),
+        outPattern
+      ]);
+
+      const frames = [];
+      for (let i = 1; i <= MAX_FRAMES; i++) {
+        const p = outPattern.replace("%03d", String(i).padStart(3, "0"));
+        try {
+          const buf = await readFile(p);
+          frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
+          await rm(p, { force: true });
+        } catch {
+          break;
+        }
+      }
+      await rm(inFile, { force: true });
+      return res.json({ frames, count: frames.length, duration: dur });
+    }
+
+    // 4) Extrae 1 frame por cada 'time' (más preciso/eficiente)
+    const frames = [];
+    for (const t of times.slice(0, MAX_FRAMES)) {
+      const out = join(tmpdir(), `f_${t}_${Date.now()}.jpg`);
+      await sh("ffmpeg", [
+        "-y", "-v", "error",
+        "-ss", String(t),
+        "-i", inFile,
+        "-frames:v", "1",
+        "-vf", `scale=${SCALE_W}:-2:flags=lanczos`,
+        "-q:v", String(JPG_QUALITY),
+        "-threads", String(THREADS),
+        out
+      ]);
+      const buf = await readFile(out);
+      frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
+      await rm(out, { force: true });
     }
 
     await rm(inFile, { force: true });
-    res.json({ frames, count: frames.length });
+    res.json({ frames, count: frames.length, duration: dur, used_times: times.slice(0, MAX_FRAMES) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
