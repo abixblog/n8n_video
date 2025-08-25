@@ -198,40 +198,33 @@ app.post("/frames", async (req, res) => {
 app.post("/render", async (req, res) => {
   const b = req.body || {};
 
-  // Requeridos
   const video_url = b.video_url;
   const audio_url = b.audio_url;
   if (!video_url || !audio_url) {
     return res.status(400).json({ error: "video_url and audio_url required" });
   }
 
-  // Canvas (por defecto vertical 1080x1920)
   const target_width  = num(b.target_width,  1080, 240, 3840);
   const target_height = num(b.target_height, 1920, 240, 3840);
 
-  // Transformaciones visuales
-  const mirror      = bool(b.mirror, true);      // hflip
-  const vflip       = bool(b.vflip, false);      // volteo vertical
+  const mirror      = bool(b.mirror, true);
+  const vflip       = bool(b.vflip, false);
   const zoom_factor = num(b.zoom_factor, 1.10, 0.5,  2.0);
   const rotate_deg  = num(b.rotate_deg, 3,   -180, 180);
 
-  // Color / tono
   const contrast    = num(b.contrast,    1.20, 0.5,  3.0);
   const brightness  = num(b.brightness,  0.00, -1.0, 1.0);
   const saturation  = num(b.saturation,  1.00, 0.0,  3.0);
   const gamma       = num(b.gamma,       1.00, 0.10, 3.0);
-  const grayscale   = bool(b.grayscale, false);  // si true, satura=0
+  const grayscale   = bool(b.grayscale, false);
 
-  // Nitidez / blur
-  const sharpen     = num(b.sharpen, 0.0, 0.0, 2.0); // unsharp amount
-  const blur        = num(b.blur,    0.0, 0.0, 5.0); // gblur sigma
+  const sharpen     = num(b.sharpen, 0.0, 0.0, 2.0);
+  const blur        = num(b.blur,    0.0, 0.0, 5.0);
 
-  // Subtítulos opcionales
   const srt_url     = b.srt_url || null;
 
-  // Audio
   const loop_video  = bool(b.loop_video, true);
-  const audio_gain  = num(b.audio_gain, 1.0, 0.0, 10.0); // volumen del audio externo
+  const audio_gain  = num(b.audio_gain, 1.0, 0.0, 10.0);
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
   const inA = join(tmpdir(), `a_${Date.now()}.mp3`);
@@ -240,7 +233,6 @@ app.post("/render", async (req, res) => {
   let finished = false;
 
   try {
-    // Descargas con timeout y retry
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 60000, retries: 1 });
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
@@ -253,22 +245,13 @@ app.post("/render", async (req, res) => {
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
-    // ==== Construcción dinámica del filtro de video ====
     const vf = [];
-
-    // flips
     if (mirror) vf.push("hflip");
     if (vflip)  vf.push("vflip");
-
-    // zoom (antes de rotar)
     if (zoom_factor !== 1) vf.push(`scale=iw*${zoom_factor}:ih*${zoom_factor}`);
-    // crop dummy para mantener canvas tras zoom (sin cambiar proporciones)
     vf.push("crop=iw:ih");
-
-    // rotación
     if (rotate_deg) vf.push(`rotate=${rotate_deg}*PI/180`);
 
-    // color
     const sat = grayscale ? 0 : saturation;
     const eqParams = [];
     if (contrast   !== 1) eqParams.push(`contrast=${contrast.toFixed(2)}`);
@@ -277,24 +260,19 @@ app.post("/render", async (req, res) => {
     if (gamma      !== 1) eqParams.push(`gamma=${gamma.toFixed(2)}`);
     if (eqParams.length)  vf.push(`eq=${eqParams.join(":")}`);
 
-    // blur / sharpen
     if (blur    > 0) vf.push(`gblur=sigma=${blur.toFixed(2)}`);
     if (sharpen > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${sharpen.toFixed(2)}`);
 
-    // cover a canvas objetivo y recorte exacto
     vf.push(`scale=${target_width}:${target_height}:force_original_aspect_ratio=cover`);
     vf.push(`crop=${target_width}:${target_height}`);
 
-    // subtítulos embebidos (si hay)
     if (srtPath) {
-      // Requiere tener instalada una fuente (Dockerfile instala DejaVu Sans)
       const style = "FontName=DejaVu Sans,Fontsize=36,BorderStyle=3,Outline=2,Shadow=0,PrimaryColour=&H00FFFFFF&,OutlineColour=&H80000000&,MarginV=48,Alignment=2";
       vf.push(`subtitles='${srtPath.replace(/\\/g, "/")}':force_style='${style}'`);
     }
 
     const filters = vf.join(",");
 
-    // ==== FFmpeg args (audio_gain opcional) ====
     const args = ["-y"];
     if (loop_video) args.push("-stream_loop", "-1");
     args.push(
@@ -314,7 +292,6 @@ app.post("/render", async (req, res) => {
 
     await sh("ffmpeg", args);
 
-    // respuesta en streaming
     res.setHeader("Content-Type", "video/mp4");
     await pipeline(createReadStream(out), res);
     finished = true;
@@ -335,6 +312,7 @@ app.post("/render", async (req, res) => {
     }
   }
 });
+
 
 // ---------------- listen ----------------
 const PORT = process.env.PORT || 8080;
