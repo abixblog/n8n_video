@@ -246,23 +246,54 @@ app.post('/render', async (req, res) => {
   try {
     // Video
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
-    if (!vres.ok) return res.status(400).json({ error: 'fetch video failed', status: vres.status });
-    assertContentType(vres, ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'], 'video_url');
+    if (!vres.ok)
+      return res
+        .status(400)
+        .json({ error: 'fetch video failed', status: vres.status });
+    assertContentType(
+      vres,
+      ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'],
+      'video_url'
+    );
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
     // Audio
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
-    if (!ares.ok) return res.status(400).json({ error: 'fetch audio failed', status: ares.status });
-    assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
+    if (!ares.ok)
+      return res
+        .status(400)
+        .json({ error: 'fetch audio failed', status: ares.status });
+    assertContentType(
+      ares,
+      [
+        'audio',
+        'mpeg',
+        'mp3',
+        'aac',
+        'mp4',
+        'x-m4a',
+        'wav',
+        'x-wav',
+        'octet-stream',
+      ],
+      'audio_url'
+    );
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
     // Subtítulos (opcional) — AQUÍ creamos srtPath
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
-      if (!s.ok) return res.status(400).json({ error: 'fetch srt failed', status: s.status });
+      if (!s.ok)
+        return res
+          .status(400)
+          .json({ error: 'fetch srt failed', status: s.status });
       // Drive a veces devuelve text/plain u octet-stream
-      assertContentType(s, ['srt','subtitle','text','plain','octet-stream'], 'srt_url');
+      assertContentType(
+        s,
+        ['srt', 'subtitle', 'text', 'plain', 'octet-stream'],
+        'srt_url'
+      );
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
@@ -272,45 +303,78 @@ app.post('/render', async (req, res) => {
     if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
     vf.push('crop=iw:ih');
     if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180`);
-    vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
-    if (SHARPEN > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
-    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
+    vf.push(
+      `eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`
+    );
+    if (SHARPEN > 0)
+      vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
+    vf.push(
+      `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`
+    );
     vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
     // Subtítulos (al final de la cadena)
     if (srtPath) {
-      const FS = Math.max(18, Math.round(TARGET_H * 0.014)); // ~27px en 1080x1920
+      // Tamaño chico (~19–22 px en 1080x1920). Ajustá el factor 0.010 a gusto.
+      const FS = Math.max(14, Math.round(TARGET_H * 0.01));
+
       const style = [
+        'PlayResX=1080', // asegura el ancho lógico para el wrap
+        'PlayResY=1920',
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
-        'BorderStyle=1',              // 1=contorno, 3=caja
-        'Outline=2',
+        'BorderStyle=1', // SIN caja opaca (solo contorno)
+        'Outline=3', // grosor del borde
         'Shadow=0',
-        'PrimaryColour=&H00FFFFFF&',
-        'OutlineColour=&H80000000&',
-        'Alignment=2',                // centrado abajo
-        'MarginV=96',
-        'MarginL=60','MarginR=60',
-        'WrapStyle=2'
+        'PrimaryColour=&H00FFFFFF&', // texto blanco
+        'OutlineColour=&H0000FFFF&', // borde AMARILLO (AA BB GG RR -> 00 00 FF FF)
+        'Alignment=2', // centrado abajo
+        'MarginV=108',
+        'MarginL=140', // +margen lateral para evitar desborde
+        'MarginR=140',
+        'WrapStyle=2', // mejor salto de línea por espacios
       ].join(',');
-      vf.push(`subtitles='${srtPath.replace(/\\/g,'/')}':force_style='${style}':charenc=UTF-8`);
+
+      vf.push(
+        `subtitles='${srtPath.replace(
+          /\\/g,
+          '/'
+        )}':force_style='${style}':charenc=UTF-8`
+      );
     }
 
     const args = ['-y'];
     if (LOOP_VIDEO) args.push('-stream_loop', '-1');
     args.push(
-      '-i', inV,
-      '-i', inA,
-      '-v', 'error',
-      '-filter:v', vf.join(','),
-      '-map', '0:v:0',
-      '-map', '1:a:0',
+      '-i',
+      inV,
+      '-i',
+      inA,
+      '-v',
+      'error',
+      '-filter:v',
+      vf.join(','),
+      '-map',
+      '0:v:0',
+      '-map',
+      '1:a:0',
       '-shortest',
-      '-c:v', 'libx264', '-preset', PRESET, '-crf', String(CRF),
-      '-c:a', 'aac', '-b:a', AUDIO_BITRATE,
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      '-threads', String(THREADS),
+      '-c:v',
+      'libx264',
+      '-preset',
+      PRESET,
+      '-crf',
+      String(CRF),
+      '-c:a',
+      'aac',
+      '-b:a',
+      AUDIO_BITRATE,
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      '-threads',
+      String(THREADS),
       out
     );
 
@@ -323,13 +387,24 @@ app.post('/render', async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: String(err) });
   } finally {
     const clean = async () => {
-      try { await rm(inV, { force: true }); } catch {}
-      try { await rm(inA, { force: true }); } catch {}
-      try { await rm(out, { force: true }); } catch {}
-      try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
+      try {
+        await rm(inV, { force: true });
+      } catch {}
+      try {
+        await rm(inA, { force: true });
+      } catch {}
+      try {
+        await rm(out, { force: true });
+      } catch {}
+      try {
+        if (srtPath) await rm(srtPath, { force: true });
+      } catch {}
     };
     if (finished) await clean();
-    else { res.on?.('close', clean); await clean(); }
+    else {
+      res.on?.('close', clean);
+      await clean();
+    }
   }
 });
 
