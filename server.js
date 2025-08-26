@@ -1,6 +1,3 @@
-// server.js — Node 20 (ESM)
-// package.json debe tener: { "type": "module" }
-
 import express from 'express';
 import cors from 'cors';
 import { pipeline } from 'node:stream/promises';
@@ -282,19 +279,32 @@ app.post('/render', async (req, res) => {
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
     // Subtítulos (opcional)
-    if (srt_url) {
-      srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
-      const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
-      if (!s.ok)
-        return res
-          .status(400)
-          .json({ error: 'fetch srt failed', status: s.status });
-      assertContentType(
-        s,
-        ['application/x-subrip', 'srt', 'text', 'plain', 'octet-stream'],
-        'srt_url'
+    if (srtPath) {
+      // Tamaño dinámico (~29px en 1080x1920). Bajalo a 0.013 si lo querés más chico.
+      const FS = Math.max(18, Math.round(TARGET_H * 0.015));
+
+      // Contorno limpio (sin caja opaca). Cambiá BorderStyle=3 para caja.
+      const style = [
+        'FontName=DejaVu Sans',
+        `Fontsize=${FS}`,
+        'BorderStyle=1', // 1=contorno, 3=caja
+        'Outline=2',
+        'Shadow=0',
+        'PrimaryColour=&H00FFFFFF&',
+        'OutlineColour=&H80000000&',
+        'Alignment=2', // centrado abajo
+        'MarginV=96',
+        'MarginL=60',
+        'MarginR=60',
+        'WrapStyle=2', // saltos de línea mejores
+      ].join(',');
+
+      vf.push(
+        `subtitles='${srtPath.replace(
+          /\\/g,
+          '/'
+        )}':force_style='${style}':charenc=UTF-8`
       );
-      await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
     // Cadena de filtros (estático):
