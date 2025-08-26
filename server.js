@@ -28,12 +28,12 @@ const TARGET_H = 1920;
 
 const MIRROR = true; // espejo horizontal
 const PRE_ZOOM = 1.12; // zoom leve previo (escala relativa)
-const ROTATE_DEG = 2.5; // grados de rotación
+const ROTATE_DEG = 0; // grados de rotación
 
 const CONTRAST = 1.15;
 const BRIGHTNESS = 0.05;
 const SATURATION = 1.1;
-const SHARPEN = 0.6; // 0 = off; típicamente 0.3–1.0
+const SHARPEN = 0; // 0 = off; típicamente 0.3–1.0
 
 const LOOP_VIDEO = true; // si el audio es más largo, repetir video
 const CRF = 21; // calidad H.264
