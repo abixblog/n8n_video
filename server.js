@@ -228,6 +228,9 @@ app.post('/frames', async (req, res) => {
 // -------- /render (estático) --------
 // Body: { video_url, audio_url, srt_url? }
 // Responde: MP4 (stream)
+// -------- /render (estático) --------
+// Body: { video_url, audio_url, srt_url? }
+// Responde: MP4 (stream)
 app.post('/render', async (req, res) => {
   const { video_url, audio_url, srt_url } = req.body || {};
   if (!video_url || !audio_url) {
@@ -243,140 +246,76 @@ app.post('/render', async (req, res) => {
   try {
     // Video
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
-    if (!vres.ok)
-      return res
-        .status(400)
-        .json({ error: 'fetch video failed', status: vres.status });
-    assertContentType(
-      vres,
-      ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'],
-      'video_url'
-    );
+    if (!vres.ok) return res.status(400).json({ error: 'fetch video failed', status: vres.status });
+    assertContentType(vres, ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'], 'video_url');
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
     // Audio
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
-    if (!ares.ok)
-      return res
-        .status(400)
-        .json({ error: 'fetch audio failed', status: ares.status });
-    assertContentType(
-      ares,
-      [
-        'audio',
-        'mpeg',
-        'mp3',
-        'aac',
-        'mp4',
-        'x-m4a',
-        'wav',
-        'x-wav',
-        'octet-stream',
-      ],
-      'audio_url'
-    );
-
+    if (!ares.ok) return res.status(400).json({ error: 'fetch audio failed', status: ares.status });
+    assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
-    // Subtítulos (opcional)
-    if (srtPath) {
-      // Tamaño dinámico (~29px en 1080x1920). Bajalo a 0.013 si lo querés más chico.
-      const FS = Math.max(18, Math.round(TARGET_H * 0.015));
+    // Subtítulos (opcional) — AQUÍ creamos srtPath
+    if (srt_url) {
+      srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
+      const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
+      if (!s.ok) return res.status(400).json({ error: 'fetch srt failed', status: s.status });
+      // Drive a veces devuelve text/plain u octet-stream
+      assertContentType(s, ['srt','subtitle','text','plain','octet-stream'], 'srt_url');
+      await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
+    }
 
-      // Contorno limpio (sin caja opaca). Cambiá BorderStyle=3 para caja.
+    // Cadena de filtros
+    const vf = [];
+    if (MIRROR) vf.push('hflip');
+    if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
+    vf.push('crop=iw:ih');
+    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180`);
+    vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
+    if (SHARPEN > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
+    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
+    vf.push(`crop=${TARGET_W}:${TARGET_H}`);
+
+    // Subtítulos (al final de la cadena)
+    if (srtPath) {
+      const FS = Math.max(18, Math.round(TARGET_H * 0.014)); // ~27px en 1080x1920
       const style = [
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
-        'BorderStyle=1', // 1=contorno, 3=caja
+        'BorderStyle=1',              // 1=contorno, 3=caja
         'Outline=2',
         'Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
         'OutlineColour=&H80000000&',
-        'Alignment=2', // centrado abajo
+        'Alignment=2',                // centrado abajo
         'MarginV=96',
-        'MarginL=60',
-        'MarginR=60',
-        'WrapStyle=2', // saltos de línea mejores
+        'MarginL=60','MarginR=60',
+        'WrapStyle=2'
       ].join(',');
-
-      vf.push(
-        `subtitles='${srtPath.replace(
-          /\\/g,
-          '/'
-        )}':force_style='${style}':charenc=UTF-8`
-      );
-    }
-
-    // Cadena de filtros (estático):
-    // 1) espejo (opcional)
-    // 2) zoom leve (scale relativo) + crop dummy
-    // 3) rotación
-    // 4) corrección de color EQ
-    // 5) sharpen
-    // 6) fit a 1080x1920 "cover": scale con force_original_aspect_ratio=increase + crop final
-    const vf = [];
-    if (MIRROR) vf.push('hflip');
-    if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
-    vf.push('crop=iw:ih'); // mantiene lienzo tras zoom
-    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180`);
-    vf.push(
-      `eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`
-    );
-    if (SHARPEN > 0)
-      vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
-    // "cover" compatible (usa increase, no 'cover'):
-    vf.push(
-      `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`
-    );
-    vf.push(`crop=${TARGET_W}:${TARGET_H}`);
-
-    if (srtPath) {
-      // Estilo ASS seguro (requiere una fuente instalada, ej. DejaVu Sans)
-      const style =
-        'FontName=DejaVu Sans,Fontsize=36,BorderStyle=3,Outline=2,Shadow=0,PrimaryColour=&H00FFFFFF&,OutlineColour=&H80000000&,MarginV=48,Alignment=2';
-      vf.push(
-        `subtitles='${srtPath.replace(/\\/g, '/')}':force_style='${style}'`
-      );
+      vf.push(`subtitles='${srtPath.replace(/\\/g,'/')}':force_style='${style}':charenc=UTF-8`);
     }
 
     const args = ['-y'];
     if (LOOP_VIDEO) args.push('-stream_loop', '-1');
     args.push(
-      '-i',
-      inV,
-      '-i',
-      inA,
-      '-v',
-      'error',
-      '-filter:v',
-      vf.join(','),
-      '-map',
-      '0:v:0',
-      '-map',
-      '1:a:0',
-      '-shortest', // termina con el audio
-      '-c:v',
-      'libx264',
-      '-preset',
-      PRESET,
-      '-crf',
-      String(CRF),
-      '-c:a',
-      'aac',
-      '-b:a',
-      AUDIO_BITRATE,
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      '-threads',
-      String(THREADS),
+      '-i', inV,
+      '-i', inA,
+      '-v', 'error',
+      '-filter:v', vf.join(','),
+      '-map', '0:v:0',
+      '-map', '1:a:0',
+      '-shortest',
+      '-c:v', 'libx264', '-preset', PRESET, '-crf', String(CRF),
+      '-c:a', 'aac', '-b:a', AUDIO_BITRATE,
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-threads', String(THREADS),
       out
     );
 
     await sh('ffmpeg', args);
 
-    // Respuesta en streaming
     res.setHeader('Content-Type', 'video/mp4');
     await pipeline(createReadStream(out), res);
     finished = true;
@@ -384,26 +323,13 @@ app.post('/render', async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: String(err) });
   } finally {
     const clean = async () => {
-      try {
-        await rm(inV, { force: true });
-      } catch {}
-      try {
-        await rm(inA, { force: true });
-      } catch {}
-      try {
-        await rm(out, { force: true });
-      } catch {}
-      try {
-        if (srtPath) await rm(srtPath, { force: true });
-      } catch {}
+      try { await rm(inV, { force: true }); } catch {}
+      try { await rm(inA, { force: true }); } catch {}
+      try { await rm(out, { force: true }); } catch {}
+      try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
     };
-    if (finished) {
-      await clean();
-    } else {
-      // si el cliente corta la conexión
-      res.on?.('close', clean);
-      await clean();
-    }
+    if (finished) await clean();
+    else { res.on?.('close', clean); await clean(); }
   }
 });
 
