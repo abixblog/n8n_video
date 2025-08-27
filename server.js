@@ -327,10 +327,10 @@ app.post('/render', async (req, res) => {
         'Shadow=0',
         'PrimaryColour=&H00FFFFFF&', // texto blanco
         'OutlineColour=&H0000FFFF&', // borde AMARILLO (AA BB GG RR -> 00 00 FF FF)
-        'Alignment=2', // centrado abajo
+        'Alignment=5', // centrado abajo
         'MarginV=108',
-        'MarginL=140', // +margen lateral para evitar desborde
-        'MarginR=140',
+        'MarginL=180', // +margen lateral para evitar desborde
+        'MarginR=180',
         'WrapStyle=2', // mejor salto de línea por espacios
       ].join(',');
 
