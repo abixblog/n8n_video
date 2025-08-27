@@ -316,8 +316,7 @@ app.post('/render', async (req, res) => {
     // Subtítulos (al final de la cadena)
     if (srtPath) {
       // Tamaño chico (~19–22 px en 1080x1920). Ajustá el factor 0.010 a gusto.
-      const FS = Math.max(22, Math.round(TARGET_H * 0.01));
-
+      const FS = Math.max(14, Math.round(TARGET_H * 0.03));
       const style = [
         'PlayResX=1080', // asegura el ancho lógico para el wrap
         'PlayResY=1920',
