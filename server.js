@@ -281,6 +281,7 @@ app.post('/render', async (req, res) => {
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
     // Subtítulos (opcional) — AQUÍ creamos srtPath
+    // --- descarga del SRT (no lo borres) ---
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
@@ -288,16 +289,11 @@ app.post('/render', async (req, res) => {
         return res
           .status(400)
           .json({ error: 'fetch srt failed', status: s.status });
-      // Drive a veces devuelve text/plain u octet-stream
-      assertContentType(
-        s,
-        ['srt', 'subtitle', 'text', 'plain', 'octet-stream'],
-        'srt_url'
-      );
+      assertContentType(s, ['srt', 'text', 'plain', 'octet-stream'], 'srt_url');
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
-    // Cadena de filtros
+    // --- cadena de filtros de video ---
     const vf = [];
     if (MIRROR) vf.push('hflip');
     if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
@@ -313,40 +309,30 @@ app.post('/render', async (req, res) => {
     );
     vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
-    // Subtítulos (al final de la cadena)
-    // ... después de crear const vf = [] y de haber descargado srt_url -> srtPath
-    // ... después de crear const vf = [] y de haber descargado srt_url -> srtPath
-    if (srt_url) {
-      srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
-      const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
-      if (!s.ok)
-        return res
-          .status(400)
-          .json({ error: 'fetch srt failed', status: s.status });
-      assertContentType(s, ['srt', 'text', 'plain', 'octet-stream'], 'srt_url');
-      await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
-
-      // Tamaño pequeño (≈21px en 1080x1920). Ajusta 0.010–0.012 si quieres aún más chico/grande
-      const FS = Math.max(14, Math.round(TARGET_H * 0.3));
-
-      // Centrado vertical (Alignment=5) + márgenes anchos para evitar desborde
+    // --- SUBTÍTULOS (UNA SOLA VEZ, AL FINAL) ---
+    // pequeño, sin fondo, borde amarillo, centrado vertical, más margen
+    if (srtPath) {
+      const FS = Math.max(20, Math.round(TARGET_H * 0.018)); // ~35px en 1080x1920
       const style = [
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
-        'BorderStyle=1', // sin caja opaca
+        'BorderStyle=1', // contorno (no caja opaca)
         'Outline=3', // grosor del borde
         'Shadow=0',
         'PrimaryColour=&H00FFFFFF&', // texto blanco
-        'OutlineColour=&H00FFFF00&', // borde amarillo (BGR)
+        'OutlineColour=&H0000FFFF&', // borde amarillo (formato AABBGGRR)
         'Alignment=5', // centro vertical y horizontal
-        'MarginV=0', // 0 = exactamente al centro; sube/baja cambiando este valor
-        'MarginL=180', // más margen izquierdo
-        'MarginR=180', // más margen derecho
-        'WrapStyle=2', // mejor quiebre de línea
+        'MarginV=0',
+        'MarginL=220', // más margen lateral para que no se desborde
+        'MarginR=220',
+        'WrapStyle=2', // mejor corte de línea
       ].join(',');
-
-      const esc = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-      vf.push(`subtitles='${esc}':force_style='${style}':charenc=UTF-8`);
+      vf.push(
+        `subtitles='${srtPath.replace(
+          /\\/g,
+          '/'
+        )}':force_style='${style}':charenc=UTF-8`
+      );
     }
 
     const args = ['-y'];
