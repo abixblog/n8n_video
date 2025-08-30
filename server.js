@@ -312,19 +312,19 @@ app.post('/render', async (req, res) => {
     // --- SUBTÍTULOS (UNA SOLA VEZ, AL FINAL) ---
     // pequeño, sin fondo, borde amarillo, centrado vertical, más margen
     if (srtPath) {
-      const FS = Math.max(18, Math.round(TARGET_H * 0.014)); // ~27px en 1080x1920
+      const FS = Math.max(20, Math.round(TARGET_H * 0.02)); // ~27px en 1080x1920
       const style = [
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
         'BorderStyle=1', // 1=contorno, 3=caja
-        'Outline=2',
+        'Outline=3',
         'Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
-        'OutlineColour=&H80000000&',
+        'OutlineColour=&H0000FFFF&',
         'Alignment=2', // centrado abajo
         'MarginV=96',
-        'MarginL=60',
-        'MarginR=60',
+        'MarginL=220',
+        'MarginR=220',
         'WrapStyle=2',
       ].join(',');
       vf.push(
