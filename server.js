@@ -322,11 +322,11 @@ app.post('/render', async (req, res) => {
         'Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
         'OutlineColour=&H0000FFFF&',
-        'Alignment=3', // centrado abajo
+        'Alignment=2', // centrado abajo
         'MarginV=96',
         'MarginL=40',
         'MarginR=40',
-        'WrapStyle=3',
+        'WrapStyle=2',
       ].join(',');
       vf.push(
         `subtitles='${srtPath.replace(
