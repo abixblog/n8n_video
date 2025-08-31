@@ -324,9 +324,9 @@ app.post('/render', async (req, res) => {
         'OutlineColour=&H0000FFFF&',
         'Alignment=3', // centrado abajo
         'MarginV=96',
-        'MarginL=140',
-        'MarginR=140',
-        'WrapStyle=1.5',
+        'MarginL=40',
+        'MarginR=40',
+        'WrapStyle=0',
       ].join(',');
       vf.push(
         `subtitles='${srtPath.replace(
