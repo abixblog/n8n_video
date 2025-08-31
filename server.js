@@ -326,7 +326,7 @@ app.post('/render', async (req, res) => {
         'MarginV=96',
         'MarginL=140',
         'MarginR=140',
-        'WrapStyle=0',
+        'WrapStyle=1.5',
       ].join(',');
       vf.push(
         `subtitles='${srtPath.replace(
