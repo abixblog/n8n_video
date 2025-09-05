@@ -147,12 +147,10 @@ app.post('/frames', async (req, res) => {
         times.push(+t.toFixed(3));
         if (times.length >= MAX_FRAMES) break;
       }
-      // Si el video es corto y no se alcanzó ningún múltiplo, toma 1 frame al medio:
       if (times.length === 0) {
         times = [+Math.max(0, dur / 2).toFixed(3)];
       }
     } else {
-      // Fallback: si no tenemos duración, extraemos con fps como antes
       const outPattern = join(tmpdir(), `f_${Date.now()}-%03d.jpg`);
       await sh('ffmpeg', [
         '-y',
@@ -186,7 +184,6 @@ app.post('/frames', async (req, res) => {
       return res.json({ frames, count: frames.length, duration: dur });
     }
 
-    // 4) Extrae 1 frame por cada 'time' (más preciso/eficiente)
     const frames = [];
     for (const t of times.slice(0, MAX_FRAMES)) {
       const out = join(tmpdir(), `f_${t}_${Date.now()}.jpg`);
@@ -225,12 +222,6 @@ app.post('/frames', async (req, res) => {
   }
 });
 
-// -------- /render (estático) --------
-// Body: { video_url, audio_url, srt_url? }
-// Responde: MP4 (stream)
-// -------- /render (estático) --------
-// Body: { video_url, audio_url, srt_url? }
-// Responde: MP4 (stream)
 app.post('/render', async (req, res) => {
   const { video_url, audio_url, srt_url } = req.body || {};
   if (!video_url || !audio_url) {
@@ -244,7 +235,6 @@ app.post('/render', async (req, res) => {
   let finished = false;
 
   try {
-    // Video
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
     if (!vres.ok)
       return res
@@ -257,7 +247,6 @@ app.post('/render', async (req, res) => {
     );
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
-    // Audio
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
     if (!ares.ok)
       return res
@@ -280,8 +269,6 @@ app.post('/render', async (req, res) => {
     );
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
-    // Subtítulos (opcional) — AQUÍ creamos srtPath
-    // --- descarga del SRT (no lo borres) ---
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
@@ -293,7 +280,6 @@ app.post('/render', async (req, res) => {
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
-    // --- cadena de filtros de video ---
     const vf = [];
     if (MIRROR) vf.push('hflip');
     if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
@@ -324,8 +310,8 @@ app.post('/render', async (req, res) => {
         'OutlineColour=&H0000FFFF&',
         'Alignment=2', // centrado abajo
         'MarginV=96',
-        'MarginL=40',
-        'MarginR=40',
+        'MarginL=140',
+        'MarginR=140',
         'WrapStyle=2',
       ].join(',');
       vf.push(
