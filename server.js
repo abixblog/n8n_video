@@ -298,37 +298,39 @@ app.post('/render', async (req, res) => {
     // --- SUBTÍTULOS (UNA SOLA VEZ, AL FINAL) ---
     // pequeño, sin fondo, borde amarillo, centrado vertical, más margen
     if (srtPath) {
-  // Tamaño de fuente estable por altura (mejor que H/W)
-  const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
+      // Tamaño por altura (pequeño)
+      const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
 
-  // Safe area lateral: 15% por lado (ajusta 0.12–0.20 según veas)
-  const sidePct = 0.15;
-  const ML = Math.round(TARGET_W * sidePct);
-  const MR = ML;
+      // Márgenes laterales: ~6% del ancho (ajusta 0.04–0.10)
+      const sidePct = 0.06;
+      const ML = Math.round(TARGET_W * sidePct);
+      const MR = ML;
 
-  // Margen inferior ~5% de la altura
-  const MV = Math.round(TARGET_H * 0.05);
+      // Margen inferior ~5% de la altura
+      const MV = Math.round(TARGET_H * 0.05);
 
-  const style = [
-    'FontName=DejaVu Sans',
-    `Fontsize=${FS}`,
-    'BorderStyle=1',
-    'Outline=1',
-    'Shadow=0',
-    'PrimaryColour=&H00FFFFFF&',
-    'OutlineColour=&H0000FFFF&',
-    'Alignment=2',       // centrado abajo
-    `MarginV=${MV}`,
-    `MarginL=${ML}`,
-    `MarginR=${MR}`,
-    'WrapStyle=3'        // smart wrap (evita desbordes)
-  ].join(',');
+      const style = [
+        'FontName=DejaVu Sans',
+        `Fontsize=${FS}`,
+        'BorderStyle=1',
+        'Outline=1',
+        'Shadow=0',
+        'PrimaryColour=&H00FFFFFF&',
+        'OutlineColour=&H0000FFFF&',
+        'Alignment=2',
+        `MarginV=${MV}`,
+        `MarginL=${ML}`,
+        `MarginR=${MR}`,
+        'WrapStyle=0', // (o 3). ¡Nunca 2!
+      ].join(',');
 
-  vf.push(
-    `subtitles='${srtPath.replace(/\\/g,'/')}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
-  );
-}
-
+      vf.push(
+        `subtitles='${srtPath.replace(
+          /\\/g,
+          '/'
+        )}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
+      );
+    }
 
     const args = ['-y'];
     if (LOOP_VIDEO) args.push('-stream_loop', '-1');
