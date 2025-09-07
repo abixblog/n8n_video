@@ -302,7 +302,7 @@ app.post('/render', async (req, res) => {
       const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
 
       // Márgenes laterales: ~6% del ancho (ajusta 0.04–0.10)
-      const sidePct = 0.06;
+      const sidePct = 0.04;
       const ML = Math.round(TARGET_W * sidePct);
       const MR = ML;
 
