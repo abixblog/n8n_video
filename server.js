@@ -223,18 +223,33 @@ app.post('/frames', async (req, res) => {
 });
 
 app.post('/render', async (req, res) => {
-  const { video_url, audio_url, srt_url } = req.body || {};
+  const {
+    video_url,
+    audio_url,
+    srt_url,
+    // NUEVO
+    bgm_url,
+    bgm_volume,
+    duck,
+    duck_threshold,
+    duck_ratio,
+    duck_attack_ms,
+    duck_release_ms,
+    bgm_offset_sec,
+  } = req.body || {};
   if (!video_url || !audio_url) {
     return res.status(400).json({ error: 'video_url and audio_url required' });
   }
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
-  const inA = join(tmpdir(), `a_${Date.now()}.mp3`);
+  const inA = join(tmpdir(), `a_${Date.now()}.mp3`); // VO / locución
   const out = join(tmpdir(), `out_${Date.now()}.mp4`);
   let srtPath = null;
+  let bgmPath = null;
   let finished = false;
 
   try {
+    // --------- VIDEO ---------
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
     if (!vres.ok)
       return res
@@ -247,6 +262,7 @@ app.post('/render', async (req, res) => {
     );
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
+    // --------- VO / LOCUCIÓN ---------
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
     if (!ares.ok)
       return res
@@ -269,6 +285,7 @@ app.post('/render', async (req, res) => {
     );
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
+    // --------- SUBTÍTULOS (opcional) ---------
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
@@ -280,6 +297,33 @@ app.post('/render', async (req, res) => {
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
+    // --------- BGM (opcional) ---------
+    if (bgm_url) {
+      bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
+      const b = await fetchWithTimeout(bgm_url, { timeoutMs: 120000 });
+      if (!b.ok)
+        return res
+          .status(400)
+          .json({ error: 'fetch bgm failed', status: b.status });
+      assertContentType(
+        b,
+        [
+          'audio',
+          'mpeg',
+          'mp3',
+          'aac',
+          'mp4',
+          'x-m4a',
+          'wav',
+          'x-wav',
+          'octet-stream',
+        ],
+        'bgm_url'
+      );
+      await pipeline(toNodeReadable(b.body), createWriteStream(bgmPath));
+    }
+
+    // --------- FILTROS DE VIDEO (como ya lo tenías) ---------
     const vf = [];
     if (MIRROR) vf.push('hflip');
     if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
@@ -295,8 +339,7 @@ app.post('/render', async (req, res) => {
     );
     vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
-    // --- SUBTÍTULOS (UNA SOLA VEZ, AL FINAL) ---
-    // pequeño, sin fondo, borde amarillo, centrado vertical, más margen
+    // Subtítulos: pequeños, centrados vertical, sin fondo, borde amarillo, márgenes amplios
     if (srtPath) {
       // Tamaño por altura (pequeño)
       const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
@@ -331,21 +374,54 @@ app.post('/render', async (req, res) => {
       );
     }
 
-    const args = ['-y'];
+    // --------- AUDIO: mezcla VO + BGM ---------
+    const BGM_VOL = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
+    const DUCK = duck === undefined ? true : !!duck;
+    const DUCK_T = Number(duck_threshold ?? 0.1);
+    const DUCK_R = Number(duck_ratio ?? 8);
+    const DUCK_A = Number(duck_attack_ms ?? 5);
+    const DUCK_REL = Number(duck_release_ms ?? 250);
+    const BGM_OFF = Math.max(0, Number(bgm_offset_sec ?? 0));
+    const BGM_OFF_MS = Math.round(BGM_OFF * 1000);
+
+    // filter_complex SOLO para audio
+    let aComplex = null;
+    if (bgmPath) {
+      const adelay = BGM_OFF_MS ? `,adelay=${BGM_OFF_MS}|${BGM_OFF_MS}` : '';
+      aComplex = [
+        `[1:a]aresample=async=1, aformat=fltp:44100:stereo[nar]`,
+        `[2:a]aresample=async=1, aformat=fltp:44100:stereo,volume=${BGM_VOL}${adelay}[bgm]`,
+        DUCK
+          ? `[bgm][nar]sidechaincompress=threshold=${DUCK_T}:ratio=${DUCK_R}:attack=${DUCK_A}:release=${DUCK_REL}[duck]`
+          : null,
+        DUCK
+          ? `[duck][nar]amix=inputs=2:duration=first:dropout_transition=200[aout]`
+          : `[nar][bgm]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
+      ]
+        .filter(Boolean)
+        .join(';');
+    }
+
+    // --------- CONSTRUCCIÓN DEL COMANDO ---------
+    const args = ['-y', '-loglevel', 'warning'];
     if (LOOP_VIDEO) args.push('-stream_loop', '-1');
+    args.push('-i', inV, '-i', inA);
+    if (bgmPath) args.push('-stream_loop', '-1', '-i', bgmPath); // BGM en loop
+
+    // Video filter
+    args.push('-filter:v', vf.join(','));
+
+    // Audio graph (si hay BGM)
+    if (aComplex) {
+      args.push('-filter_complex', aComplex);
+    }
+
+    // Mapas
     args.push(
-      '-i',
-      inV,
-      '-i',
-      inA,
-      '-v',
-      'error',
-      '-filter:v',
-      vf.join(','),
       '-map',
       '0:v:0',
       '-map',
-      '1:a:0',
+      aComplex ? '[aout]' : '1:a:0',
       '-shortest',
       '-c:v',
       'libx264',
@@ -386,6 +462,9 @@ app.post('/render', async (req, res) => {
       } catch {}
       try {
         if (srtPath) await rm(srtPath, { force: true });
+      } catch {}
+      try {
+        if (bgmPath) await rm(bgmPath, { force: true });
       } catch {}
     };
     if (finished) await clean();
