@@ -311,7 +311,7 @@ app.post('/render', async (req, res) => {
         'WrapStyle=0',
       ].join(',');
 
-      vf.push(
+      vFilters.push(
         `subtitles='${srtPath.replace(/\\/g, '/')}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
       );
     }
