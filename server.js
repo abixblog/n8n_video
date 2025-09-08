@@ -227,7 +227,6 @@ app.post('/render', async (req, res) => {
     video_url,
     audio_url,
     srt_url,
-    // NUEVO
     bgm_url,
     bgm_volume,
     duck,
@@ -242,7 +241,7 @@ app.post('/render', async (req, res) => {
   }
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
-  const inA = join(tmpdir(), `a_${Date.now()}.mp3`); // VO / locución
+  const inA = join(tmpdir(), `a_${Date.now()}.mp3`); // narración
   const out = join(tmpdir(), `out_${Date.now()}.mp4`);
   let srtPath = null;
   let bgmPath = null;
@@ -251,32 +250,21 @@ app.post('/render', async (req, res) => {
   try {
     // --------- VIDEO ---------
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
-    if (!vres.ok)
-      return res.status(400).json({ error: 'fetch video failed', status: vres.status });
-    assertContentType(
-      vres,
-      ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'],
-      'video_url'
-    );
+    if (!vres.ok) return res.status(400).json({ error: 'fetch video failed', status: vres.status });
+    assertContentType(vres, ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'], 'video_url');
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
     // --------- VO / LOCUCIÓN ---------
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
-    if (!ares.ok)
-      return res.status(400).json({ error: 'fetch audio failed', status: ares.status });
-    assertContentType(
-      ares,
-      ['audio', 'mpeg', 'mp3', 'aac', 'mp4', 'x-m4a', 'wav', 'x-wav', 'octet-stream'],
-      'audio_url'
-    );
+    if (!ares.ok) return res.status(400).json({ error: 'fetch audio failed', status: ares.status });
+    assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
     // --------- SUBTÍTULOS (opcional) ---------
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
-      if (!s.ok)
-        return res.status(400).json({ error: 'fetch srt failed', status: s.status });
+      if (!s.ok) return res.status(400).json({ error: 'fetch srt failed', status: s.status });
       assertContentType(s, ['srt', 'text', 'plain', 'octet-stream'], 'srt_url');
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
@@ -285,29 +273,23 @@ app.post('/render', async (req, res) => {
     if (bgm_url) {
       bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
       const b = await fetchWithTimeout(bgm_url, { timeoutMs: 120000 });
-      if (!b.ok)
-        return res.status(400).json({ error: 'fetch bgm failed', status: b.status });
-      assertContentType(
-        b,
-        ['audio', 'mpeg', 'mp3', 'aac', 'mp4', 'x-m4a', 'wav', 'x-wav', 'octet-stream'],
-        'bgm_url'
-      );
+      if (!b.ok) return res.status(400).json({ error: 'fetch bgm failed', status: b.status });
+      assertContentType(b, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'bgm_url');
       await pipeline(toNodeReadable(b.body), createWriteStream(bgmPath));
     }
 
-    // --------- FILTROS DE VIDEO ---------
-    const vf = [];
-    if (MIRROR) vf.push('hflip');
-    if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
-    vf.push('crop=iw:ih');
-    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180`);
-    vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
-    if (SHARPEN > 0)
-      vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
-    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
-    vf.push(`crop=${TARGET_W}:${TARGET_H}`);
+    // --------- CADENAS DE FILTROS (TODO en -filter_complex) ---------
+    // Video
+    const vFilters = [];
+    if (MIRROR) vFilters.push('hflip');
+    if (PRE_ZOOM !== 1) vFilters.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
+    vFilters.push('crop=iw:ih');
+    if (ROTATE_DEG) vFilters.push(`rotate=${ROTATE_DEG}*PI/180`);
+    vFilters.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
+    if (SHARPEN > 0) vFilters.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
+    vFilters.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
+    vFilters.push(`crop=${TARGET_W}:${TARGET_H}`);
 
-    // Subtítulos (si quieres centro vertical: Alignment=5)
     if (srtPath) {
       const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
       const sidePct = 0.04;
@@ -334,7 +316,9 @@ app.post('/render', async (req, res) => {
       );
     }
 
-    // --------- AUDIO: mezcla VO + BGM ---------
+    const vChain = `[0:v]${vFilters.join(',')}[vout]`;
+
+    // Audio
     const BGM_VOL = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
     const DUCK = duck === undefined ? true : !!duck;
     const DUCK_T = Number(duck_threshold ?? 0.1);
@@ -344,31 +328,34 @@ app.post('/render', async (req, res) => {
     const BGM_OFF = Math.max(0, Number(bgm_offset_sec ?? 0));
     const BGM_OFF_MS = Math.round(BGM_OFF * 1000);
 
-    // Cadena SOLO de audio (filter_complex)
-    let aComplex = null;
+    let aChain;
     if (bgmPath) {
+      // Normalizamos a estéreo 44.1k y aplicamos volumen/offset al BGM
       const adelay = BGM_OFF_MS ? `,adelay=${BGM_OFF_MS}|${BGM_OFF_MS}` : '';
-      aComplex = [
-        // VO -> estéreo 44.1 kHz (etiqueta [nar])
+      aChain = [
         `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
         `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[nar]`,
 
-        // BGM -> estéreo 44.1 kHz + volumen + (offset opcional) (etiqueta [bgm])
         `[2:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
         `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
         `volume=${BGM_VOL}${adelay}[bgm]`,
 
-        // Ducking opcional con compresor sidechain
         DUCK
           ? `[bgm][nar]sidechaincompress=threshold=${DUCK_T}:ratio=${DUCK_R}:attack=${DUCK_A}:release=${DUCK_REL}[duck]`
           : null,
 
-        // Mezcla final: la PRIMERA entrada define la duración (queremos la de la narración)
         DUCK
           ? `[nar][duck]amix=inputs=2:duration=first:dropout_transition=200[aout]`
           : `[nar][bgm]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
       ].filter(Boolean).join(';');
+    } else {
+      // Sin BGM: sólo normalizamos la narración
+      aChain =
+        `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
+        `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
     }
+
+    const filterComplex = [vChain, aChain].join(';');
 
     // --------- COMANDO FFmpeg ---------
     const args = ['-y', '-loglevel', 'warning'];
@@ -376,14 +363,10 @@ app.post('/render', async (req, res) => {
     args.push('-i', inV, '-i', inA);
     if (bgmPath) args.push('-stream_loop', '-1', '-i', bgmPath);
 
-    // Filtros
-    args.push('-filter:v', vf.join(','));
-    if (aComplex) args.push('-filter_complex', aComplex);
-
-    // Mapas
     args.push(
-      '-map', '0:v:0',
-      '-map', aComplex ? '[aout]' : '1:a:0',
+      '-filter_complex', filterComplex,
+      '-map', '[vout]',
+      '-map', '[aout]',
       '-shortest',
       '-c:v', 'libx264',
       '-preset', PRESET,
@@ -412,13 +395,9 @@ app.post('/render', async (req, res) => {
       try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
     };
     if (finished) await clean();
-    else {
-      res.on?.('close', clean);
-      await clean();
-    }
+    else { res.on?.('close', clean); await clean(); }
   }
 });
-
 
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, uptime: process.uptime() });
