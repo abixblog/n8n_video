@@ -4,7 +4,6 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
-import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
