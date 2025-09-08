@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFile, spawn } from 'node:child_process';
 
 // =========================
 // Configuración ESTÁTICA
@@ -242,57 +243,36 @@ app.post('/render', async (req, res) => {
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
   const inA = join(tmpdir(), `a_${Date.now()}.mp3`); // narración
-  const out = join(tmpdir(), `out_${Date.now()}.mp4`);
   let srtPath = null;
   let bgmPath = null;
-  let finished = false;
+
+  // util de limpieza
+  const clean = async () => {
+    try { await rm(inV, { force: true }); } catch {}
+    try { await rm(inA, { force: true }); } catch {}
+    try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
+    try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
+  };
 
   try {
     // --------- VIDEO ---------
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
-    if (!vres.ok)
-      return res
-        .status(400)
-        .json({ error: 'fetch video failed', status: vres.status });
-    assertContentType(
-      vres,
-      ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'],
-      'video_url'
-    );
+    if (!vres.ok) return res.status(400).json({ error: 'fetch video failed', status: vres.status });
+    assertContentType(vres, ['video','mp4','quicktime','x-matroska','octet-stream'], 'video_url');
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
     // --------- VO / LOCUCIÓN ---------
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
-    if (!ares.ok)
-      return res
-        .status(400)
-        .json({ error: 'fetch audio failed', status: ares.status });
-    assertContentType(
-      ares,
-      [
-        'audio',
-        'mpeg',
-        'mp3',
-        'aac',
-        'mp4',
-        'x-m4a',
-        'wav',
-        'x-wav',
-        'octet-stream',
-      ],
-      'audio_url'
-    );
+    if (!ares.ok) return res.status(400).json({ error: 'fetch audio failed', status: ares.status });
+    assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
     // --------- SUBTÍTULOS (opcional) ---------
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
-      if (!s.ok)
-        return res
-          .status(400)
-          .json({ error: 'fetch srt failed', status: s.status });
-      assertContentType(s, ['srt', 'text', 'plain', 'octet-stream'], 'srt_url');
+      if (!s.ok) return res.status(400).json({ error: 'fetch srt failed', status: s.status });
+      assertContentType(s, ['srt','text','plain','octet-stream'], 'srt_url');
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
@@ -300,45 +280,20 @@ app.post('/render', async (req, res) => {
     if (bgm_url) {
       bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
       const b = await fetchWithTimeout(bgm_url, { timeoutMs: 120000 });
-      if (!b.ok)
-        return res
-          .status(400)
-          .json({ error: 'fetch bgm failed', status: b.status });
-      assertContentType(
-        b,
-        [
-          'audio',
-          'mpeg',
-          'mp3',
-          'aac',
-          'mp4',
-          'x-m4a',
-          'wav',
-          'x-wav',
-          'octet-stream',
-        ],
-        'bgm_url'
-      );
+      if (!b.ok) return res.status(400).json({ error: 'fetch bgm failed', status: b.status });
+      assertContentType(b, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'bgm_url');
       await pipeline(toNodeReadable(b.body), createWriteStream(bgmPath));
     }
 
-    // --------- CADENAS DE FILTROS (TODO en -filter_complex) ---------
-    // Video
+    // --------- FILTROS DE VIDEO ---------
     const vFilters = [];
     if (MIRROR) vFilters.push('hflip');
     if (PRE_ZOOM !== 1) vFilters.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
     vFilters.push('crop=iw:ih');
     if (ROTATE_DEG) vFilters.push(`rotate=${ROTATE_DEG}*PI/180`);
-    vFilters.push(
-      `eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`
-    );
-    if (SHARPEN > 0)
-      vFilters.push(
-        `unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`
-      );
-    vFilters.push(
-      `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`
-    );
+    vFilters.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
+    if (SHARPEN > 0) vFilters.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
+    vFilters.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
     vFilters.push(`crop=${TARGET_W}:${TARGET_H}`);
 
     if (srtPath) {
@@ -355,26 +310,25 @@ app.post('/render', async (req, res) => {
         'Outline=0',
         'Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
-        'Alignment=2', // usa 5 si los quieres en el centro vertical
+        'Alignment=2',
         `MarginV=${MV}`,
         `MarginL=${ML}`,
         `MarginR=${MR}`,
         'WrapStyle=0',
       ].join(',');
 
+      // Nota: no hace falta envolver todo en comillas si no hay espacios en la ruta; pero esto es robusto
       vFilters.push(
-        `subtitles='${srtPath.replace(
-          /\\/g,
-          '/'
-        )}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
+        `subtitles='${srtPath.replace(/\\/g, '/')}'` +
+        `:original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
       );
     }
 
     const vChain = `[0:v]${vFilters.join(',')}[vout]`;
 
-    // Audio
+    // --------- FILTROS DE AUDIO ---------
     const BGM_VOL = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
-    const DUCK = duck === undefined ? true : !!duck;
+    const DUCK = (duck === undefined) ? true : !!duck;
     const DUCK_T = Number(duck_threshold ?? 0.1);
     const DUCK_R = Number(duck_ratio ?? 8);
     const DUCK_A = Number(duck_attack_ms ?? 5);
@@ -385,28 +339,26 @@ app.post('/render', async (req, res) => {
     let aChain;
     if (bgmPath) {
       const adelay = BGM_OFF_MS ? `,adelay=${BGM_OFF_MS}|${BGM_OFF_MS}` : '';
-
       aChain = [
-        // Narración -> estéreo 44.1k y la duplicamos
+        // Narración -> estéreo 44.1k y la duplicamos (una rama para sidechain, otra para mezcla)
         `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
           `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
           `asplit=2[nar_mix][nar_side]`,
 
-        // Música -> estéreo 44.1k + volumen + offset opcional
+        // Música -> estéreo 44.1k + volumen + offset
         `[2:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
           `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
           `volume=${BGM_VOL}${adelay}[bgm]`,
 
         // Ducking opcional
-        duck
+        DUCK
           ? `[bgm][nar_side]sidechaincompress=threshold=${DUCK_T}:ratio=${DUCK_R}:attack=${DUCK_A}:release=${DUCK_REL}[duck]`
           : `[bgm]anull[duck]`,
 
-        // Mezcla final (usamos la copia nar_mix)
+        // Mezcla final: narración (nar_mix) + BGM (duck o anull)
         `[nar_mix][duck]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
       ].join(';');
     } else {
-      // Sin BGM: normalizamos narración
       aChain =
         `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
         `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
@@ -414,69 +366,70 @@ app.post('/render', async (req, res) => {
 
     const filterComplex = [vChain, aChain].join(';');
 
-    // --------- COMANDO FFmpeg ---------
-    const args = ['-y', '-loglevel', 'warning'];
+    // --------- STREAMING A TRAVÉS DE STDOUT ---------
+    req.setTimeout(0);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('X-Accel-Buffering', 'no');  // evita buffering en NGINX
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Connection', 'keep-alive');
+
+    const args = ['-loglevel', 'warning'];
     if (LOOP_VIDEO) args.push('-stream_loop', '-1');
     args.push('-i', inV, '-i', inA);
     if (bgmPath) args.push('-stream_loop', '-1', '-i', bgmPath);
 
     args.push(
-      '-filter_complex',
-      filterComplex,
-      '-map',
-      '[vout]',
-      '-map',
-      '[aout]',
+      '-filter_complex', filterComplex,
+      '-map', '[vout]',
+      '-map', '[aout]',
       '-shortest',
-      '-c:v',
-      'libx264',
-      '-preset',
-      PRESET,
-      '-crf',
-      String(CRF),
-      '-c:a',
-      'aac',
-      '-b:a',
-      AUDIO_BITRATE,
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      '-threads',
-      String(THREADS),
-      out
+      '-c:v', 'libx264',
+      '-preset', PRESET,
+      '-crf', String(CRF),
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', AUDIO_BITRATE,
+      // MP4 fragmentado para playback progresivo vía pipe:
+      '-movflags', 'frag_keyframe+empty_moov+faststart',
+      '-f', 'mp4',
+      'pipe:1',
+      '-threads', String(THREADS)
     );
 
-    await sh('ffmpeg', args);
+    const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    res.setHeader('Content-Type', 'video/mp4');
-    await pipeline(createReadStream(out), res);
-    finished = true;
-  } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: String(err) });
-  } finally {
-    const clean = async () => {
-      try {
-        await rm(inV, { force: true });
-      } catch {}
-      try {
-        await rm(inA, { force: true });
-      } catch {}
-      try {
-        await rm(out, { force: true });
-      } catch {}
-      try {
-        if (srtPath) await rm(srtPath, { force: true });
-      } catch {}
-      try {
-        if (bgmPath) await rm(bgmPath, { force: true });
-      } catch {}
-    };
-    if (finished) await clean();
-    else {
-      res.on?.('close', clean);
+    let ffErr = '';
+    ff.stderr.on('data', (d) => { ffErr += d.toString(); });
+
+    // si el cliente corta, matamos ffmpeg
+    req.on('aborted', () => { try { ff.kill('SIGKILL'); } catch {} });
+
+    // Pipe de la salida de video hacia el response
+    ff.stdout.pipe(res);
+
+    ff.on('close', async (code) => {
       await clean();
-    }
+      if (code !== 0) {
+        // si ya enviamos headers, solo cerramos; si no, devolvemos 500
+        if (!res.headersSent) {
+          return res.status(500).json({ error: `ffmpeg exited ${code}`, detail: ffErr.slice(-2000) });
+        }
+      }
+      try { res.end(); } catch {}
+    });
+
+    ff.on('error', async (err) => {
+      await clean();
+      if (!res.headersSent) {
+        res.status(500).json({ error: String(err), detail: ffErr.slice(-2000) });
+      } else {
+        try { res.end(); } catch {}
+      }
+    });
+
+  } catch (err) {
+    await clean();
+    if (!res.headersSent) res.status(500).json({ error: String(err) });
   }
 });
 
