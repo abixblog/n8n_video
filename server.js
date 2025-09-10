@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { stat } from 'node:fs/promises';
 
 // =========================
 // Configuración ESTÁTICA
@@ -244,31 +244,35 @@ app.post('/render', async (req, res) => {
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
   const inA = join(tmpdir(), `a_${Date.now()}.mp3`); // narración / VO
+  const out = join(tmpdir(), `out_${Date.now()}.mp4`);
   let srtPath = null;
   let bgmPath = null;
-  let ff; // proceso de ffmpeg para poder matarlo si el cliente corta
-
-  const clean = async () => {
-    try { await rm(inV, { force: true }); } catch {}
-    try { await rm(inA, { force: true }); } catch {}
-    try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
-    try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
-  };
+  let finished = false;
 
   try {
-    // --------- DESCARGAS ---------
+    // --------- VIDEO ---------
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
     if (!vres.ok)
       return res.status(400).json({ error: 'fetch video failed', status: vres.status });
-    assertContentType(vres, ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'], 'video_url');
+    assertContentType(
+      vres,
+      ['video', 'mp4', 'quicktime', 'x-matroska', 'octet-stream'],
+      'video_url'
+    );
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
+    // --------- NARRACIÓN ---------
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
     if (!ares.ok)
       return res.status(400).json({ error: 'fetch audio failed', status: ares.status });
-    assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
+    assertContentType(
+      ares,
+      ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'],
+      'audio_url'
+    );
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
+    // --------- SUBTÍTULOS (opcional) ---------
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
@@ -278,12 +282,17 @@ app.post('/render', async (req, res) => {
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
+    // --------- BGM (opcional) ---------
     if (bgm_url) {
       bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
       const b = await fetchWithTimeout(bgm_url, { timeoutMs: 120000 });
       if (!b.ok)
         return res.status(400).json({ error: 'fetch bgm failed', status: b.status });
-      assertContentType(b, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'bgm_url');
+      assertContentType(
+        b,
+        ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'],
+        'bgm_url'
+      );
       await pipeline(toNodeReadable(b.body), createWriteStream(bgmPath));
     }
 
@@ -351,13 +360,8 @@ app.post('/render', async (req, res) => {
 
     const filterComplex = [vChain, aChain].join(';');
 
-    // --------- STREAMING (evita 502) ---------
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
-    res.setHeader('Cache-Control', 'no-store');
-    res.flushHeaders();
-
-    const args = ['-hide_banner', '-loglevel', 'error'];
+    // --------- FFmpeg a ARCHIVO (MP4 completo) ---------
+    const args = ['-y', '-v', 'error'];
 
     if (LOOP_VIDEO) args.push('-stream_loop', '-1');
     args.push('-i', inV, '-i', inA);
@@ -370,51 +374,42 @@ app.post('/render', async (req, res) => {
       '-c:v', 'libx264',
       '-preset', PRESET,
       '-crf', String(CRF),
-      '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-b:a', AUDIO_BITRATE,
-      // MP4 fragmentado para reproducir mientras llega
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-      '-f', 'mp4',
-      'pipe:1'
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-threads', String(THREADS),
+      out
     );
 
-    ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    await sh('ffmpeg', args);
 
-    // si el cliente cierra, matamos ffmpeg
-    const onCloseClient = () => { try { ff.kill('SIGKILL'); } catch {} };
-    res.on('close', onCloseClient);
-    res.on('error', onCloseClient);
+    // --------- SERVIR EL MP4 FINAL ---------
+    const st = await stat(out);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', String(st.size));
+    res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
 
-    // forward de stdout -> respuesta
-    ff.stdout.pipe(res);
-
-    // logs de error (opcional)
-    ff.stderr.on('data', (d) => {
-      // console.error('[ffmpeg]', d.toString());
-    });
-
-    ff.on('close', async (code) => {
-      res.off('close', onCloseClient);
-      res.off('error', onCloseClient);
-      await clean();
-      if (code !== 0 && !res.writableEnded) {
-        res.destroy(new Error('ffmpeg failed'));
-      }
-    });
-
-    ff.on('error', async (err) => {
-      await clean();
-      if (!res.headersSent) res.status(500).json({ error: String(err) });
-      else res.destroy(err);
-    });
-
+    await pipeline(createReadStream(out), res);
+    finished = true;
   } catch (err) {
-    await clean();
     if (!res.headersSent) res.status(500).json({ error: String(err) });
-    else res.destroy(err);
+  } finally {
+    const clean = async () => {
+      try { await rm(inV, { force: true }); } catch {}
+      try { await rm(inA, { force: true }); } catch {}
+      try { await rm(out, { force: true }); } catch {}
+      try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
+      try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
+    };
+    if (finished) await clean();
+    else {
+      res.on?.('close', clean);
+      await clean();
+    }
   }
 });
+
 
 
 app.get('/health', (req, res) => {
