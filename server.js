@@ -3,85 +3,52 @@ import cors from 'cors';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { createWriteStream, createReadStream } from 'node:fs';
-import { readFile, rm, stat } from 'node:fs/promises';
-import { execFile, spawn } from 'node:child_process';
+import { readFile, rm, stat, mkdir, access } from 'node:fs/promises';
+import { constants as FS_CONST } from 'node:fs';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 // =========================
-// Configuración ESTÁTICA
+// Config estática
 // =========================
+const FRAMES_EVERY_SEC = 6;
+const FRAMES_MAX = 10;
+const FRAMES_SCALE_W = 1080;
+const JPG_QUALITY = 3;
 
-// FRAMES (parámetros por defecto)
-const FRAMES_EVERY_SEC = 6;      // 1 frame cada 6 s
-const FRAMES_MAX = 10;           // máximo 10 frames
-const FRAMES_SCALE_W = 1080;     // ancho de las miniaturas
-const JPG_QUALITY = 3;           // 2 (mejor) .. 7 (peor)
-
-// RENDER (efectos fijos)
 const TARGET_W = 1080;
 const TARGET_H = 1920;
 
-const MIRROR = true;             // espejo horizontal
-const PRE_ZOOM = 1.12;           // zoom leve previo (escala relativa)
-const ROTATE_DEG = 0;            // grados de rotación
+const MIRROR = true;
+const PRE_ZOOM = 1.12;
+const ROTATE_DEG = 0;
 
 const CONTRAST = 1.15;
 const BRIGHTNESS = 0.05;
 const SATURATION = 1.1;
-const SHARPEN = 0;               // 0 = off; típicamente 0.3–1.0
+const SHARPEN = 0;
 
-const LOOP_VIDEO = true;         // si el audio es más largo, repetir video
-const CRF = 21;                  // calidad H.264
+const LOOP_VIDEO = true;
+const CRF = 21;
 const PRESET = 'veryfast';
 const AUDIO_BITRATE = '192k';
 const THREADS = Number(process.env.FFMPEG_THREADS || 1);
 
-// Límites/seguridad
-const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 10 * 60 * 1000); // 10 min
-const FFMPEG_LIMIT_SEC = Math.max(60, Number(process.env.FFMPEG_LIMIT_SEC || 600));
-const MIN_OUTPUT_BYTES = Number(process.env.MIN_OUTPUT_BYTES || 900_000);     // ~0.9MB
+// Directorio de salidas (por id)
+const OUT_DIR = join(tmpdir(), 'renders');
+await mkdir(OUT_DIR, { recursive: true });
 
 // =========================
 // Utilidades
 // =========================
-
 const execFileP = promisify(execFile);
 
 async function sh(cmd, args, opts = {}) {
   const { stdout, stderr } = await execFileP(cmd, args, { ...opts });
   return { stdout, stderr };
-}
-
-// ffmpeg con timeout: mata el proceso si se excede el tiempo
-function spawnWithTimeout(cmd, args, opts = {}, timeoutMs = 0) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    let stdout = '';
-    let killed = false;
-    let timer = null;
-
-    child.stdout?.on('data', (d) => (stdout += d.toString()));
-    child.stderr?.on('data', (d) => (stderr += d.toString()));
-    child.on('error', reject);
-
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        killed = true;
-        try { child.kill('SIGKILL'); } catch {}
-      }, timeoutMs);
-    }
-
-    child.on('close', (code) => {
-      if (timer) clearTimeout(timer);
-      if (killed) return reject(new Error(`timeout ${cmd} after ${timeoutMs}ms`));
-      if (code === 0) return resolve({ stdout, stderr });
-      reject(new Error(`${cmd} exited ${code}: ${stderr || stdout}`));
-    });
-  });
 }
 
 function toNodeReadable(stream) {
@@ -93,7 +60,7 @@ async function fetchWithTimeout(url, { timeoutMs = 30000 } = {}) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ctl.signal, redirect: 'follow' });
+    const res = await fetch(url, { signal: ctl.signal });
     return res;
   } finally {
     clearTimeout(t);
@@ -103,51 +70,56 @@ async function fetchWithTimeout(url, { timeoutMs = 30000 } = {}) {
 function assertContentType(res, allowed, label) {
   const ct = (res.headers.get('content-type') || '').toLowerCase();
   if (ct.includes('text/html')) {
-    throw new Error(`${label}: got HTML (probable página de plataforma o enlace no directo).`);
+    throw new Error(`${label}: got HTML (probable página o enlace no directo)`);
   }
   if (!allowed.some((s) => ct.includes(s))) {
     throw new Error(`${label}: unexpected content-type ${ct || '(none)'}`);
   }
 }
 
-// Devuelve duración en segundos (float). 0 si falla.
 async function probeDuration(filePath) {
   try {
     const { stdout } = await sh('ffprobe', [
-      '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
+      '-v','error',
+      '-show_entries','format=duration',
+      '-of','default=noprint_wrappers=1:nokey=1',
       filePath,
     ]);
     const d = parseFloat(String(stdout).trim());
     return Number.isFinite(d) ? d : 0;
-  } catch {
-    return 0;
-  }
+  } catch { return 0; }
+}
+
+function getBase(req) {
+  // Soporta reverse proxy (Render/NGINX) y HTTPS
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0];
+  const host  = (req.headers['x-forwarded-host']  || req.get('host'));
+  return `${proto}://${host}`;
 }
 
 // =========================
-// Cola en memoria (render asíncrono)
+// Cola en memoria (async)
 // =========================
-
-const JOBS = new Map(); // id -> { id, status, outPath, error, createdAt, updatedAt, params, files, doneAt }
+const JOBS = new Map(); // id -> { id, status, outPath, error, createdAt, updatedAt, doneAt, params }
 let RUNNING = 0;
 const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY ?? 1) || 1);
-const OUTPUT_TTL_MS = Number(process.env.OUTPUT_TTL_MS || 30 * 60 * 1000); // 30 min
+const OUTPUT_TTL_MS = Number(process.env.OUTPUT_TTL_MS || 30 * 60 * 1000);
 
 function enqueueRender(params) {
   const id = randomUUID();
+  const outPath = join(OUT_DIR, `${id}.mp4`);  // <- salida determinística por id
+
   JOBS.set(id, {
     id,
     status: 'queued',
-    outPath: null,
+    outPath,
     error: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    params,
-    files: null,
     doneAt: null,
+    params,
   });
+
   setImmediate(maybeRun);
   return id;
 }
@@ -177,40 +149,21 @@ function maybeRun() {
 }
 
 async function processJob(job) {
-  // heartbeat para que updatedAt se mueva mientras procesa
-  const hb = setInterval(() => (job.updatedAt = Date.now()), 5000);
-
   try {
-    // ejecuta con timeout duro: mata ffmpeg si se cuelga
-    const { out, files } = await Promise.race([
-      doRenderOnce(job.params),
-      new Promise((_, rej) =>
-        setTimeout(() => rej(new Error(`timeout render after ${JOB_TIMEOUT_MS}ms`)), JOB_TIMEOUT_MS)
-      ),
-    ]);
-    job.outPath = out;
-    job.files = files;
+    await doRenderOnce(job.id, job.params, job.outPath);
     job.status = 'done';
     job.updatedAt = job.doneAt = Date.now();
   } catch (err) {
     job.error = String(err);
     job.status = 'error';
     job.updatedAt = Date.now();
-  } finally {
-    clearInterval(hb);
   }
 }
 
-// Limpieza periódica de MP4 y trabajos viejos
+// Limpieza periódica
 setInterval(async () => {
   const now = Date.now();
   for (const [id, job] of JOBS) {
-    // si un processing quedó "zombie" > 15 min, márcalo error
-    if (job.status === 'processing' && now - job.updatedAt > 15 * 60 * 1000) {
-      job.status = 'error';
-      job.error = 'stalled processing (watchdog)';
-      job.updatedAt = now;
-    }
     if (job.status === 'done' && job.doneAt && now - job.doneAt > OUTPUT_TTL_MS) {
       try { if (job.outPath) await rm(job.outPath, { force: true }); } catch {}
       JOBS.delete(id);
@@ -224,57 +177,49 @@ setInterval(async () => {
 // =========================
 // App
 // =========================
-
 const app = express();
+app.set('trust proxy', 1);           // <- importante en Render/NGINX
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
-// -------- /frames (DINÁMICO por duración) --------
+// -------- /frames --------
 app.post('/frames', async (req, res) => {
   try {
     const { video_url, every_sec, max_frames, scale, jpg_quality } = req.body || {};
-
     if (!video_url) return res.status(400).json({ error: 'video_url required' });
 
     const EVERY_SEC   = Math.max(1, Number(every_sec ?? FRAMES_EVERY_SEC));
     const MAX_FRAMES  = Math.max(1, Math.min(50, Number(max_frames ?? FRAMES_MAX)));
     const SCALE_W     = Math.max(240, Math.min(2160, Number(scale ?? FRAMES_SCALE_W)));
     const JPGQ        = Math.max(2, Math.min(7, Number(jpg_quality ?? JPG_QUALITY)));
-    const THREADS_LOC = THREADS;
 
-    // 1) Descarga del video
     const inFile = join(tmpdir(), `in_${Date.now()}.mp4`);
     const r = await fetchWithTimeout(video_url, { timeoutMs: 60000 });
     if (!r.ok) return res.status(400).json({ error: 'fetch video failed', status: r.status });
-    assertContentType(r, ['video', 'mp4', 'octet-stream'], 'video_url');
+    assertContentType(r, ['video','mp4','octet-stream'], 'video_url');
     await pipeline(toNodeReadable(r.body), createWriteStream(inFile));
 
-    // 2) Duración
     const dur = await probeDuration(inFile);
-
-    // 3) Tiempos
     let times = [];
     if (dur > 0) {
       for (let t = EVERY_SEC; t <= dur; t += EVERY_SEC) {
         times.push(+t.toFixed(3));
         if (times.length >= MAX_FRAMES) break;
       }
-      if (times.length === 0) times = [+Math.max(0, dur / 2).toFixed(3)];
+      if (times.length === 0) times = [+Math.max(0, dur/2).toFixed(3)];
     }
 
-    // 4) Extrae frames
-    let frames = [];
-
+    const frames = [];
     if (times.length) {
       for (const t of times.slice(0, MAX_FRAMES)) {
         const out = join(tmpdir(), `f_${t}_${Date.now()}.jpg`);
         await sh('ffmpeg', [
-          '-y', '-v', 'error',
+          '-y','-v','error',
           '-ss', String(t), '-i', inFile,
-          '-frames:v', '1',
+          '-frames:v','1',
           '-vf', `scale=${SCALE_W}:-2:flags=lanczos`,
           '-q:v', String(JPGQ),
-          '-threads', String(THREADS_LOC),
+          '-threads', String(THREADS),
           out,
         ]);
         const buf = await readFile(out);
@@ -284,12 +229,12 @@ app.post('/frames', async (req, res) => {
     } else {
       const outPattern = join(tmpdir(), `f_${Date.now()}-%03d.jpg`);
       await sh('ffmpeg', [
-        '-y', '-v', 'error',
+        '-y','-v','error',
         '-i', inFile,
         '-vf', `fps=1/${EVERY_SEC},scale=${SCALE_W}:-2:flags=lanczos`,
         '-frames:v', String(MAX_FRAMES),
         '-q:v', String(JPGQ),
-        '-threads', String(THREADS_LOC),
+        '-threads', String(THREADS),
         outPattern,
       ]);
       for (let i = 1; i <= MAX_FRAMES; i++) {
@@ -298,43 +243,27 @@ app.post('/frames', async (req, res) => {
           const buf = await readFile(p);
           frames.push(`data:image/jpeg;base64,${buf.toString('base64')}`);
           await rm(p, { force: true });
-        } catch {
-          break;
-        }
+        } catch { break; }
       }
     }
 
     await rm(inFile, { force: true });
-
-    res.json({
-      frames,
-      count: frames.length,
-      duration: dur,
-      used_times: times.slice(0, FRAMES_MAX),
-    });
+    res.json({ frames, count: frames.length, duration: dur, used_times: times.slice(0, FRAMES_MAX) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
 // =========================
-// Render ASÍNCRONO (cola)
+// Render asíncrono
 // =========================
-
 app.post('/render', async (req, res) => {
   try {
     const {
-      video_url,
-      audio_url,       // narración / VO  (requerido)
-      srt_url,         // opcional
-      bgm_url,         // opcional
-      bgm_volume,      // 0..2 (default 0.16)
-      duck,            // true/false (default true)
-      duck_threshold,  // p.ej. 0.1
-      duck_ratio,      // p.ej. 8
-      duck_attack_ms,  // p.ej. 5
-      duck_release_ms, // p.ej. 250
-      bgm_offset_sec,  // p.ej. 0..n
+      video_url, audio_url,
+      srt_url, bgm_url,
+      bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
+      bgm_offset_sec,
     } = req.body || {};
 
     if (!video_url || !audio_url) {
@@ -347,7 +276,7 @@ app.post('/render', async (req, res) => {
       bgm_offset_sec,
     });
 
-    const base = `${req.protocol}://${req.get('host')}`;
+    const base = getBase(req);
     return res.status(202).json({
       id,
       status_url: `${base}/render/${id}`,
@@ -358,79 +287,91 @@ app.post('/render', async (req, res) => {
   }
 });
 
-// GET /render/:id -> estado del trabajo
-app.get('/render/:id', (req, res) => {
-  const job = JOBS.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'not found' });
+// Estado del job
+app.get('/render/:id', async (req, res) => {
+  const id = req.params.id;
+  const base = getBase(req);
 
-  const { id, status, error, createdAt, updatedAt, doneAt } = job;
-  const base = `${req.protocol}://${req.get('host')}`;
-  res.json({
-    id, status, error, createdAt, updatedAt, doneAt,
-    status_url: `${base}/render/${id}`,
-    video_url:  `${base}/render/${id}/video`,
-  });
+  let job = JOBS.get(id);
+  if (!job) {
+    // Fallback: si no está en memoria pero el archivo existe, reporta "done"
+    const outPath = join(OUT_DIR, `${id}.mp4`);
+    try {
+      await access(outPath, FS_CONST.F_OK);
+      return res.json({
+        id, status: 'done', error: null,
+        createdAt: null, updatedAt: null, doneAt: null,
+        video_url: `${base}/render/${id}/video`,
+      });
+    } catch {
+      return res.status(404).json({ error: 'not found' });
+    }
+  }
+
+  const payload = {
+    id: job.id,
+    status: job.status,
+    error: job.error,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    doneAt: job.doneAt,
+  };
+  if (job.status === 'done') {
+    payload.video_url = `${base}/render/${id}/video`;
+  }
+  res.json(payload);
 });
 
-// GET /render/:id/video -> sirve el MP4 final con Content-Length
+// Descarga del MP4
 app.get('/render/:id/video', async (req, res) => {
-  const job = JOBS.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'not found' });
+  const id = req.params.id;
+  const outPath = join(OUT_DIR, `${id}.mp4`);
 
-  if (job.status === 'error') return res.status(500).json({ error: job.error });
-  if (job.status !== 'done') return res.status(425).json({ error: 'not ready' }); // 425 Too Early
+  // Si hay job en memoria, respeta su estado
+  const job = JOBS.get(id);
+  if (job) {
+    if (job.status === 'error') return res.status(500).json({ error: job.error });
+    if (job.status !== 'done') return res.status(425).json({ error: 'not ready' });
+  }
 
   try {
-    const st = await stat(job.outPath);
+    const st = await stat(outPath);
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', String(st.size));
     res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    await pipeline(createReadStream(job.outPath), res);
+    await pipeline(createReadStream(outPath), res);
   } catch (err) {
-    res.status(500).json({ error: String(err) });
+    res.status(404).json({ error: 'not found' });
   }
 });
 
 // =========================
-// Implementación de render único (archivo MP4)
+// Render real (una vez)
 // =========================
-
-async function doRenderOnce(params) {
+async function doRenderOnce(id, params, outPath) {
   const {
-    video_url,
-    audio_url,       // VO
-    srt_url,         // opcional
-    bgm_url,         // opcional
-    bgm_volume,
-    duck,
-    duck_threshold,
-    duck_ratio,
-    duck_attack_ms,
-    duck_release_ms,
+    video_url, audio_url,
+    srt_url, bgm_url,
+    bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
     bgm_offset_sec,
   } = params;
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
   const inA = join(tmpdir(), `a_${Date.now()}.mp3`);
-  const out = join(tmpdir(), `out_${Date.now()}.mp4`);
   let srtPath = null;
   let bgmPath = null;
 
   try {
-    // --------- VIDEO ---------
     const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
     if (!vres.ok) throw new Error(`fetch video failed: ${vres.status}`);
     assertContentType(vres, ['video','mp4','quicktime','x-matroska','octet-stream'], 'video_url');
     await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
 
-    // --------- VO ---------
     const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
     if (!ares.ok) throw new Error(`fetch audio failed: ${ares.status}`);
     assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
     await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
 
-    // --------- SRT ---------
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
       const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
@@ -439,7 +380,6 @@ async function doRenderOnce(params) {
       await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
     }
 
-    // --------- BGM ---------
     if (bgm_url) {
       bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
       const b = await fetchWithTimeout(bgm_url, { timeoutMs: 120000 });
@@ -448,7 +388,6 @@ async function doRenderOnce(params) {
       await pipeline(toNodeReadable(b.body), createWriteStream(bgmPath));
     }
 
-    // --------- VIDEO FILTERS ---------
     const vf = [];
     if (MIRROR) vf.push('hflip');
     if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
@@ -480,7 +419,6 @@ async function doRenderOnce(params) {
 
     const vChain = `[0:v]${vf.join(',')}[vout]`;
 
-    // --------- AUDIO (VO + BGM con ducking) ---------
     const BGM_VOL  = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
     const DUCK     = duck === undefined ? true : !!duck;
     const DUCK_T   = Number(duck_threshold ?? 0.1);
@@ -506,71 +444,51 @@ async function doRenderOnce(params) {
         `[nar_mix][duck]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
       ].join(';');
     } else {
-      aChain =
-        `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
-        `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+      aChain = `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
+               `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
     }
 
     const filterComplex = [vChain, aChain].join(';');
 
-    // --------- FFmpeg a ARCHIVO ---------
-    const args = ['-y', '-v', 'error'];
-    if (LOOP_VIDEO) args.push('-stream_loop', '-1');  // video
+    const args = ['-y','-v','error'];
+    if (LOOP_VIDEO) args.push('-stream_loop','-1');
     args.push('-i', inV, '-i', inA);
-    if (bgmPath) args.push('-stream_loop', '-1', '-i', bgmPath); // música
-
+    if (bgmPath) args.push('-stream_loop','-1','-i', bgmPath);
     args.push(
-      // límite interno de ffmpeg (seguridad adicional)
-      '-timelimit', String(FFMPEG_LIMIT_SEC),
       '-filter_complex', filterComplex,
-      '-map', '[vout]', '-map', '[aout]',
+      '-map','[vout]','-map','[aout]',
       '-shortest',
-      '-c:v', 'libx264',
+      '-c:v','libx264',
       '-preset', PRESET,
       '-crf', String(CRF),
-      '-c:a', 'aac',
+      '-c:a','aac',
       '-b:a', AUDIO_BITRATE,
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
+      '-pix_fmt','yuv420p',
+      '-movflags','+faststart',
       '-threads', String(THREADS),
-      out
+      outPath
     );
 
-    // Usamos spawn con timeout duro (JOB_TIMEOUT_MS) por si ffmpeg se cuelga
-    await spawnWithTimeout('ffmpeg', args, {}, JOB_TIMEOUT_MS);
+    await sh('ffmpeg', args);
 
-    // Verificación de salida para evitar MP4 "dañado"
-    const st = await stat(out);
-    const dur = await probeDuration(out);
-    if (st.size < MIN_OUTPUT_BYTES) {
-      throw new Error(`invalid output: too small (${st.size} bytes)`);
-    }
-    if (!dur || dur <= 0.3) {
-      throw new Error(`invalid output: missing/zero duration (ffprobe=${dur})`);
-    }
-
-    // Limpia intermedios pero conserva el MP4 final
+    // Limpia temporales
     try { await rm(inV, { force: true }); } catch {}
     try { await rm(inA, { force: true }); } catch {}
     try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
     try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
-
-    return { out, files: { inV, inA, srtPath, bgmPath } };
   } catch (err) {
-    // En error, intenta limpiar todo
     try { await rm(inV, { force: true }); } catch {}
     try { await rm(inA, { force: true }); } catch {}
     try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
     try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
-    try { await rm(out, { force: true }); } catch {}
+    try { await rm(outPath, { force: true }); } catch {}
     throw err;
   }
 }
 
 // =========================
-// Healthcheck
+// Health
 // =========================
-
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, uptime: process.uptime() });
 });
@@ -581,6 +499,4 @@ app.listen(PORT, () => {
   console.log(`ready on :${PORT} (/frames, /render [POST], /render/:id [GET], /render/:id/video [GET])`);
   maybeRun();
 });
-
-// “por si acaso” arranca el scheduler
 setInterval(maybeRun, 1000);
