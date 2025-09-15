@@ -15,11 +15,11 @@ import { randomUUID } from 'node:crypto';
 // Config estática
 // =========================
 const FRAMES_EVERY_SEC = 6;
-const FRAMES_MAX = 10;
-const FRAMES_SCALE_W = 1080;
+const FRAMES_MAX = 854;
+const FRAMES_SCALE_W = 480;
 const JPG_QUALITY = 3;
 
-const TARGET_W = 1080;
+const TARGET_W = 4;
 const TARGET_H = 1920;
 
 const MIRROR = true;
