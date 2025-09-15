@@ -37,7 +37,13 @@ const PRESET = 'veryfast';
 const AUDIO_BITRATE = '192k';
 const THREADS = Number(process.env.FFMPEG_THREADS || 1);
 
-// Directorio de salidas (por id)
+// Timeouts/limites
+const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 60_000);
+const READ_TIMEOUT_MS    = Number(process.env.READ_TIMEOUT_MS    || 120_000);
+const RENDER_TIMEOUT_MS  = Number(process.env.RENDER_TIMEOUT_MS  || 25 * 60_000); // 25 min
+const JOB_TIMEOUT_MS     = Number(process.env.JOB_TIMEOUT_MS     || 30 * 60_000); // 30 min
+
+// Directorio de salidas (persistente por id)
 const OUT_DIR = join(tmpdir(), 'renders');
 await mkdir(OUT_DIR, { recursive: true });
 
@@ -47,24 +53,17 @@ await mkdir(OUT_DIR, { recursive: true });
 const execFileP = promisify(execFile);
 
 async function sh(cmd, args, opts = {}) {
-  const { stdout, stderr } = await execFileP(cmd, args, { ...opts });
+  const { stdout, stderr } = await execFileP(cmd, args, {
+    maxBuffer: 8 * 1024 * 1024, // 8 MB
+    timeout: 0,                 // por defecto sin timeout aquí (lo ponemos por job abajo)
+    ...opts,
+  });
   return { stdout, stderr };
 }
 
 function toNodeReadable(stream) {
   if (!stream) throw new Error('empty stream');
   return typeof stream.pipe === 'function' ? stream : Readable.fromWeb(stream);
-}
-
-async function fetchWithTimeout(url, { timeoutMs = 30000 } = {}) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: ctl.signal });
-    return res;
-  } finally {
-    clearTimeout(t);
-  }
 }
 
 function assertContentType(res, allowed, label) {
@@ -74,6 +73,46 @@ function assertContentType(res, allowed, label) {
   }
   if (!allowed.some((s) => ct.includes(s))) {
     throw new Error(`${label}: unexpected content-type ${ct || '(none)'}`);
+  }
+}
+
+// Descarga con timeout de conexión y de lectura del stream
+async function downloadToFile(url, destPath, { allowedCT, label, connectTimeoutMs = CONNECT_TIMEOUT_MS, readTimeoutMs = READ_TIMEOUT_MS } = {}) {
+  const ctl = new AbortController();
+  const connectTimer = setTimeout(() => ctl.abort(), connectTimeoutMs);
+  let res;
+  try {
+    res = await fetch(url, { signal: ctl.signal });
+  } finally {
+    clearTimeout(connectTimer);
+  }
+  if (!res.ok) throw new Error(`${label}: fetch failed ${res.status}`);
+  if (allowedCT) assertContentType(res, allowedCT, label);
+
+  const body = toNodeReadable(res.body);
+  const ws = createWriteStream(destPath);
+
+  // Read-timeout: si no llega data en readTimeoutMs, aborta
+  let readTimer = setTimeout(() => {
+    try { body.destroy(new Error(`${label}: read timeout`)); } catch {}
+    try { ws.destroy(new Error(`${label}: read timeout`)); } catch {}
+  }, readTimeoutMs);
+
+  body.on('data', () => {
+    clearTimeout(readTimer);
+    readTimer = setTimeout(() => {
+      try { body.destroy(new Error(`${label}: read timeout`)); } catch {}
+      try { ws.destroy(new Error(`${label}: read timeout`)); } catch {}
+    }, readTimeoutMs);
+  });
+
+  try {
+    await pipeline(body, ws);
+  } catch (e) {
+    try { await rm(destPath, { force: true }); } catch {}
+    throw e;
+  } finally {
+    clearTimeout(readTimer);
   }
 }
 
@@ -91,10 +130,20 @@ async function probeDuration(filePath) {
 }
 
 function getBase(req) {
-  // Soporta reverse proxy (Render/NGINX) y HTTPS
   const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0];
   const host  = (req.headers['x-forwarded-host']  || req.get('host'));
   return `${proto}://${host}`;
+}
+
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+async function withTimeout(promise, ms, onTimeout) {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(onTimeout || `Timeout after ${ms}ms`)), ms);
+  });
+  try { return await Promise.race([promise, timeout]); }
+  finally { clearTimeout(t); }
 }
 
 // =========================
@@ -107,8 +156,7 @@ const OUTPUT_TTL_MS = Number(process.env.OUTPUT_TTL_MS || 30 * 60 * 1000);
 
 function enqueueRender(params) {
   const id = randomUUID();
-  const outPath = join(OUT_DIR, `${id}.mp4`);  // <- salida determinística por id
-
+  const outPath = join(OUT_DIR, `${id}.mp4`);
   JOBS.set(id, {
     id,
     status: 'queued',
@@ -119,15 +167,12 @@ function enqueueRender(params) {
     doneAt: null,
     params,
   });
-
   setImmediate(maybeRun);
   return id;
 }
 
 function nextQueued() {
-  for (const job of JOBS.values()) {
-    if (job.status === 'queued') return job;
-  }
+  for (const job of JOBS.values()) if (job.status === 'queued') return job;
   return null;
 }
 
@@ -149,14 +194,22 @@ function maybeRun() {
 }
 
 async function processJob(job) {
+  // Heartbeat de "sigue vivo"
+  const hb = setInterval(() => { job.updatedAt = Date.now(); }, 5000);
   try {
-    await doRenderOnce(job.id, job.params, job.outPath);
+    await withTimeout(
+      doRenderOnce(job.id, job.params, job.outPath),
+      JOB_TIMEOUT_MS,
+      'render job timeout'
+    );
     job.status = 'done';
     job.updatedAt = job.doneAt = Date.now();
   } catch (err) {
     job.error = String(err);
     job.status = 'error';
     job.updatedAt = Date.now();
+  } finally {
+    clearInterval(hb);
   }
 }
 
@@ -178,7 +231,7 @@ setInterval(async () => {
 // App
 // =========================
 const app = express();
-app.set('trust proxy', 1);           // <- importante en Render/NGINX
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
@@ -194,12 +247,9 @@ app.post('/frames', async (req, res) => {
     const JPGQ        = Math.max(2, Math.min(7, Number(jpg_quality ?? JPG_QUALITY)));
 
     const inFile = join(tmpdir(), `in_${Date.now()}.mp4`);
-    const r = await fetchWithTimeout(video_url, { timeoutMs: 60000 });
-    if (!r.ok) return res.status(400).json({ error: 'fetch video failed', status: r.status });
-    assertContentType(r, ['video','mp4','octet-stream'], 'video_url');
-    await pipeline(toNodeReadable(r.body), createWriteStream(inFile));
-
+    await downloadToFile(video_url, inFile, { allowedCT: ['video','mp4','octet-stream'], label: 'video_url' });
     const dur = await probeDuration(inFile);
+
     let times = [];
     if (dur > 0) {
       for (let t = EVERY_SEC; t <= dur; t += EVERY_SEC) {
@@ -287,14 +337,12 @@ app.post('/render', async (req, res) => {
   }
 });
 
-// Estado del job
 app.get('/render/:id', async (req, res) => {
   const id = req.params.id;
   const base = getBase(req);
 
   let job = JOBS.get(id);
   if (!job) {
-    // Fallback: si no está en memoria pero el archivo existe, reporta "done"
     const outPath = join(OUT_DIR, `${id}.mp4`);
     try {
       await access(outPath, FS_CONST.F_OK);
@@ -316,18 +364,14 @@ app.get('/render/:id', async (req, res) => {
     updatedAt: job.updatedAt,
     doneAt: job.doneAt,
   };
-  if (job.status === 'done') {
-    payload.video_url = `${base}/render/${id}/video`;
-  }
+  if (job.status === 'done') payload.video_url = `${base}/render/${id}/video`;
   res.json(payload);
 });
 
-// Descarga del MP4
 app.get('/render/:id/video', async (req, res) => {
   const id = req.params.id;
   const outPath = join(OUT_DIR, `${id}.mp4`);
 
-  // Si hay job en memoria, respeta su estado
   const job = JOBS.get(id);
   if (job) {
     if (job.status === 'error') return res.status(500).json({ error: job.error });
@@ -340,7 +384,7 @@ app.get('/render/:id/video', async (req, res) => {
     res.setHeader('Content-Length', String(st.size));
     res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
     await pipeline(createReadStream(outPath), res);
-  } catch (err) {
+  } catch {
     res.status(404).json({ error: 'not found' });
   }
 });
@@ -362,30 +406,29 @@ async function doRenderOnce(id, params, outPath) {
   let bgmPath = null;
 
   try {
-    const vres = await fetchWithTimeout(video_url, { timeoutMs: 120000 });
-    if (!vres.ok) throw new Error(`fetch video failed: ${vres.status}`);
-    assertContentType(vres, ['video','mp4','quicktime','x-matroska','octet-stream'], 'video_url');
-    await pipeline(toNodeReadable(vres.body), createWriteStream(inV));
-
-    const ares = await fetchWithTimeout(audio_url, { timeoutMs: 120000 });
-    if (!ares.ok) throw new Error(`fetch audio failed: ${ares.status}`);
-    assertContentType(ares, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'audio_url');
-    await pipeline(toNodeReadable(ares.body), createWriteStream(inA));
+    await downloadToFile(video_url, inV, {
+      allowedCT: ['video','mp4','quicktime','x-matroska','octet-stream'],
+      label: 'video_url',
+    });
+    await downloadToFile(audio_url, inA, {
+      allowedCT: ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'],
+      label: 'audio_url',
+    });
 
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
-      const s = await fetchWithTimeout(srt_url, { timeoutMs: 60000 });
-      if (!s.ok) throw new Error(`fetch srt failed: ${s.status}`);
-      assertContentType(s, ['srt','text','plain','octet-stream'], 'srt_url');
-      await pipeline(toNodeReadable(s.body), createWriteStream(srtPath));
+      await downloadToFile(srt_url, srtPath, {
+        allowedCT: ['srt','text','plain','octet-stream'],
+        label: 'srt_url',
+      });
     }
 
     if (bgm_url) {
       bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
-      const b = await fetchWithTimeout(bgm_url, { timeoutMs: 120000 });
-      if (!b.ok) throw new Error(`fetch bgm failed: ${b.status}`);
-      assertContentType(b, ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], 'bgm_url');
-      await pipeline(toNodeReadable(b.body), createWriteStream(bgmPath));
+      await downloadToFile(bgm_url, bgmPath, {
+        allowedCT: ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'],
+        label: 'bgm_url',
+      });
     }
 
     const vf = [];
@@ -450,11 +493,12 @@ async function doRenderOnce(id, params, outPath) {
 
     const filterComplex = [vChain, aChain].join(';');
 
-    const args = ['-y','-v','error'];
-    if (LOOP_VIDEO) args.push('-stream_loop','-1');
-    args.push('-i', inV, '-i', inA);
-    if (bgmPath) args.push('-stream_loop','-1','-i', bgmPath);
-    args.push(
+    // ffmpeg con timeout duro
+    await sh('ffmpeg', [
+      '-y','-v','error',
+      ...(LOOP_VIDEO ? ['-stream_loop','-1'] : []),
+      '-i', inV, '-i', inA,
+      ...(bgmPath ? ['-stream_loop','-1','-i', bgmPath] : []),
       '-filter_complex', filterComplex,
       '-map','[vout]','-map','[aout]',
       '-shortest',
@@ -467,9 +511,7 @@ async function doRenderOnce(id, params, outPath) {
       '-movflags','+faststart',
       '-threads', String(THREADS),
       outPath
-    );
-
-    await sh('ffmpeg', args);
+    ], { timeout: RENDER_TIMEOUT_MS, killSignal: 'SIGKILL' });
 
     // Limpia temporales
     try { await rm(inV, { force: true }); } catch {}
