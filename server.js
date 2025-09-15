@@ -19,8 +19,9 @@ const FRAMES_MAX = 854;
 const FRAMES_SCALE_W = 480;
 const JPG_QUALITY = 3;
 
-const TARGET_W = 4;
-const TARGET_H = 1920;
+// ⚠️ Resolución por defecto bajada a 720×1280 para ahorrar RAM
+const TARGET_W = Number(process.env.TARGET_W || 720);
+const TARGET_H = Number(process.env.TARGET_H || 1280);
 
 const MIRROR = true;
 const PRE_ZOOM = 1.12;
@@ -31,11 +32,15 @@ const BRIGHTNESS = 0.05;
 const SATURATION = 1.1;
 const SHARPEN = 0;
 
+// ⚠️ CRF y PRESET más ligeros por defecto
 const LOOP_VIDEO = true;
-const CRF = 21;
-const PRESET = 'veryfast';
+const CRF = Number(process.env.CRF || 24);
+const PRESET = process.env.PRESET || 'ultrafast';
 const AUDIO_BITRATE = '192k';
+
 const THREADS = Number(process.env.FFMPEG_THREADS || 1);
+const FILTER_THREADS = Number(process.env.FILTER_THREADS || 1);
+const FILTER_COMPLEX_THREADS = Number(process.env.FILTER_COMPLEX_THREADS || 1);
 
 // Timeouts/limites
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 60_000);
@@ -55,10 +60,37 @@ const execFileP = promisify(execFile);
 async function sh(cmd, args, opts = {}) {
   const { stdout, stderr } = await execFileP(cmd, args, {
     maxBuffer: 8 * 1024 * 1024, // 8 MB
-    timeout: 0,                 // por defecto sin timeout aquí (lo ponemos por job abajo)
+    timeout: 0,
     ...opts,
   });
   return { stdout, stderr };
+}
+
+// Ejecuta ffmpeg con detección de OOM y mensaje claro
+async function runFfmpeg(args, timeoutMs) {
+  try {
+    await execFileP('ffmpeg', args, {
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+    });
+  } catch (err) {
+    const stderr = String(err.stderr || '');
+    const killed =
+      err.killed ||
+      err.signal === 'SIGKILL' ||
+      err.code === 137 ||
+      /Killed|Out of memory|Cannot allocate|std::bad_alloc/i.test(stderr);
+
+    if (killed) {
+      throw new Error(
+        'ffmpeg OOM (memoria insuficiente). Sube de plan o baja resolución/preset.'
+      );
+    }
+    // recorta stderr para no desbordar respuestas
+    const brief = stderr ? stderr.slice(0, 800) : (err.message || 'ffmpeg failed');
+    throw new Error(`ffmpeg failed: ${brief}`);
+  }
 }
 
 function toNodeReadable(stream) {
@@ -77,7 +109,16 @@ function assertContentType(res, allowed, label) {
 }
 
 // Descarga con timeout de conexión y de lectura del stream
-async function downloadToFile(url, destPath, { allowedCT, label, connectTimeoutMs = CONNECT_TIMEOUT_MS, readTimeoutMs = READ_TIMEOUT_MS } = {}) {
+async function downloadToFile(
+  url,
+  destPath,
+  {
+    allowedCT,
+    label,
+    connectTimeoutMs = CONNECT_TIMEOUT_MS,
+    readTimeoutMs = READ_TIMEOUT_MS,
+  } = {}
+) {
   const ctl = new AbortController();
   const connectTimer = setTimeout(() => ctl.abort(), connectTimeoutMs);
   let res;
@@ -119,9 +160,9 @@ async function downloadToFile(url, destPath, { allowedCT, label, connectTimeoutM
 async function probeDuration(filePath) {
   try {
     const { stdout } = await sh('ffprobe', [
-      '-v','error',
-      '-show_entries','format=duration',
-      '-of','default=noprint_wrappers=1:nokey=1',
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
       filePath,
     ]);
     const d = parseFloat(String(stdout).trim());
@@ -227,8 +268,6 @@ setInterval(async () => {
   }
 }, 5 * 60 * 1000);
 
-// =========================
-// App
 // =========================
 const app = express();
 app.set('trust proxy', 1);
@@ -431,6 +470,30 @@ async function doRenderOnce(id, params, outPath) {
       });
     }
 
+    // ===== Duraciones para loop finito (evita -stream_loop -1) =====
+    const durV = await probeDuration(inV);
+    const durA = await probeDuration(inA);
+    const durB = bgmPath ? await probeDuration(bgmPath) : 0;
+
+    const videoInputArgs = [];
+    if (LOOP_VIDEO && durV > 0 && durA > 0 && durV < durA) {
+      const loops = Math.max(0, Math.ceil(durA / durV) - 1);
+      if (loops > 0) videoInputArgs.push('-stream_loop', String(loops));
+    }
+    videoInputArgs.push('-i', inV);
+
+    const bgmInputArgs = [];
+    if (bgmPath) {
+      // cubrir VO + offset
+      const need = (durA || 0) + (Number(bgm_offset_sec || 0));
+      if (durB > 0 && need > durB) {
+        const loops = Math.max(0, Math.ceil(need / durB) - 1);
+        if (loops > 0) bgmInputArgs.push('-stream_loop', String(loops));
+      }
+      bgmInputArgs.push('-i', bgmPath);
+    }
+
+    // ====== VIDEO FILTERS ======
     const vf = [];
     if (MIRROR) vf.push('hflip');
     if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
@@ -462,6 +525,7 @@ async function doRenderOnce(id, params, outPath) {
 
     const vChain = `[0:v]${vf.join(',')}[vout]`;
 
+    // ====== AUDIO (VO + BGM con ducking) ======
     const BGM_VOL  = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
     const DUCK     = duck === undefined ? true : !!duck;
     const DUCK_T   = Number(duck_threshold ?? 0.1);
@@ -487,18 +551,19 @@ async function doRenderOnce(id, params, outPath) {
         `[nar_mix][duck]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
       ].join(';');
     } else {
-      aChain = `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
-               `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+      aChain =
+        `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
+        `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
     }
 
     const filterComplex = [vChain, aChain].join(';');
 
-    // ffmpeg con timeout duro
-    await sh('ffmpeg', [
+    // ====== ffmpeg (sin stream_loop infinito; filtros limitados) ======
+    const args = [
       '-y','-v','error',
-      ...(LOOP_VIDEO ? ['-stream_loop','-1'] : []),
-      '-i', inV, '-i', inA,
-      ...(bgmPath ? ['-stream_loop','-1','-i', bgmPath] : []),
+      ...videoInputArgs,       // [-stream_loop N] -i inV
+      '-i', inA,               // VO
+      ...bgmInputArgs,         // (opcional) [-stream_loop N] -i bgm
       '-filter_complex', filterComplex,
       '-map','[vout]','-map','[aout]',
       '-shortest',
@@ -510,8 +575,13 @@ async function doRenderOnce(id, params, outPath) {
       '-pix_fmt','yuv420p',
       '-movflags','+faststart',
       '-threads', String(THREADS),
+      '-filter_threads', String(FILTER_THREADS),
+      '-filter_complex_threads', String(FILTER_COMPLEX_THREADS),
+      '-max_muxing_queue_size','4096',
       outPath
-    ], { timeout: RENDER_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    ];
+
+    await runFfmpeg(args, RENDER_TIMEOUT_MS);
 
     // Limpia temporales
     try { await rm(inV, { force: true }); } catch {}
