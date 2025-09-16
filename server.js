@@ -4,13 +4,11 @@ import cors from 'cors';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { createWriteStream, createReadStream } from 'node:fs';
-import { readFile, rm, stat, mkdir, access } from 'node:fs/promises';
-import { constants as FS_CONST } from 'node:fs';
+import { readFile, rm, stat, mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
 
 // =========================
 // Config (env overrides)
@@ -36,7 +34,7 @@ const LOOP_VIDEO = process.env.LOOP_VIDEO === 'false' ? false : true;
 
 // Encoder / velocidad
 const ENCODER = process.env.ENCODER || 'libx264'; // 'libx264' | 'h264_nvenc' | 'h264_qsv' | 'h264_vaapi'
-const PRESET  = process.env.PRESET || 'superfast'; // x264: ultrafast..veryslow / nvenc: p1..p7 (menor=p1 más rápido)
+const PRESET  = process.env.PRESET || 'superfast'; // x264: ultrafast..veryslow / nvenc: p1..p7
 const CRF     = Number(process.env.CRF || 21);
 const GOP     = Number(process.env.GOP || 120);
 const AUDIO_BITRATE = process.env.AUDIO_BITRATE || '192k';
@@ -45,20 +43,15 @@ const HWACCEL = process.env.HWACCEL; // ej. 'auto'
 
 // Subtítulos
 const SUBS_MODE = (process.env.SUBS_MODE || 'auto').toLowerCase(); // 'on' | 'off' | 'auto'
-const SUBS_FONT = process.env.SUBS_FONT || 'Arial';
+const SUBS_FONT = process.env.SUBS_FONT || 'DejaVu Sans';
 
 // Red / timeouts
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 60_000);
 const READ_TIMEOUT_MS    = Number(process.env.READ_TIMEOUT_MS    || 180_000);
 const RENDER_TIMEOUT_MS  = Number(process.env.RENDER_TIMEOUT_MS  || 30 * 60_000);
-const JOB_TIMEOUT_MS     = Number(process.env.JOB_TIMEOUT_MS     || 35 * 60_000);
 
-// Cola
-const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY ?? 1));
-const OUTPUT_TTL_MS   = Number(process.env.OUTPUT_TTL_MS || 30 * 60_000);
-
-// Salidas
-const OUT_DIR = join(tmpdir(), 'renders_async');
+// Directorio de salidas (solo para /frames; el render síncrono usa /tmp)
+const OUT_DIR = join(tmpdir(), 'renders_sync');
 await mkdir(OUT_DIR, { recursive: true });
 
 // =========================
@@ -126,12 +119,6 @@ async function runFfmpeg(args, timeoutMs = RENDER_TIMEOUT_MS) {
   }
 }
 
-function getBase(req) {
-  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0];
-  const host  = (req.headers['x-forwarded-host']  || req.get('host'));
-  return `${proto}://${host}`;
-}
-
 async function probeDuration(filePath) {
   try {
     const { stdout } = await execFileP('ffprobe', [
@@ -155,92 +142,52 @@ async function hasSubtitlesFilter() {
   return SUBS_FILTER_AVAILABLE;
 }
 
-// =========================
-// Cola en memoria
-// =========================
-const JOBS = new Map(); // id -> { id, status, outPath, error, createdAt, updatedAt, doneAt, params }
-let RUNNING = 0;
+function buildVideoFilters({ srtPath, subsEnabled }) {
+  const vf = [];
+  if (MIRROR) vf.push('hflip');
 
-function enqueueRender(params) {
-  const id = randomUUID();
-  JOBS.set(id, {
-    id,
-    status: 'queued',
-    outPath: join(OUT_DIR, `${id}.mp4`),
-    error: null,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    doneAt: null,
-    params,
-  });
-  setImmediate(maybeRun);
-  return id;
-}
+  // PRE_ZOOM eficiente: recorta antes de escalar
+  if (PRE_ZOOM && PRE_ZOOM !== 1) vf.push(`crop=iw/${PRE_ZOOM}:ih/${PRE_ZOOM}`);
 
-function nextQueued() {
-  for (const j of JOBS.values()) if (j.status === 'queued') return j;
-  return null;
-}
-
-function maybeRun() {
-  if (RUNNING >= MAX_CONCURRENCY) return;
-  const job = nextQueued();
-  if (!job) return;
-
-  job.status = 'processing';
-  job.updatedAt = Date.now();
-  RUNNING++;
-
-  processJob(job)
-    .catch(() => {})
-    .finally(() => {
-      RUNNING--;
-      maybeRun();
-    });
-}
-
-async function processJob(job) {
-  const hb = setInterval(() => { job.updatedAt = Date.now(); }, 5000);
-  try {
-    await withJobTimeout(doRenderOnce(job), JOB_TIMEOUT_MS);
-    job.status = 'done';
-    job.updatedAt = job.doneAt = Date.now();
-  } catch (err) {
-    job.error = String(err);
-    job.status = 'error';
-    job.updatedAt = Date.now();
-  } finally {
-    clearInterval(hb);
+  if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180:fillcolor=black`);
+  if (CONTRAST !== 1 || BRIGHTNESS !== 0 || SATURATION !== 1) {
+    vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
   }
-}
+  if (SHARPEN > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
 
-function withJobTimeout(promise, ms) {
-  let t;
-  const timeout = new Promise((_, rej) => t = setTimeout(() => rej(new Error('render job timeout')), ms));
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
-}
+  // Escalado rápido y recorte final
+  vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase:flags=fast_bilinear`);
+  vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
-// Limpieza
-setInterval(async () => {
-  const now = Date.now();
-  for (const [id, job] of JOBS) {
-    if (job.status === 'done' && job.doneAt && now - job.doneAt > OUTPUT_TTL_MS) {
-      try { await rm(job.outPath, { force: true }); } catch {}
-      JOBS.delete(id);
-    } else if (job.status === 'error' && now - job.updatedAt > 10 * 60_000) {
-      JOBS.delete(id);
-    }
+  if (subsEnabled && srtPath) {
+    const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
+    const ML = Math.round(TARGET_W * 0.04);
+    const MR = ML;
+    const MV = Math.round(TARGET_H * 0.05);
+    const style = [
+      `FontName=${SUBS_FONT}`,
+      `Fontsize=${FS}`,
+      'BorderStyle=1','Outline=0','Shadow=0',
+      'Alignment=2',
+      `MarginV=${MV}`, `MarginL=${ML}`, `MarginR=${MR}`,
+      'WrapStyle=0',
+    ].join(',');
+    vf.push(
+      `subtitles='${srtPath.replace(/\\/g,'/')}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
+    );
   }
-}, 5 * 60_000);
+  return vf.join(',');
+}
 
 // =========================
-// App
+// App (síncrono)
 // =========================
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
+// -------- /frames (sigue igual) --------
 app.post('/frames', async (req, res) => {
   try {
     const { video_url, every_sec, max_frames, scale, jpg_quality } = req.body || {};
@@ -285,7 +232,11 @@ app.post('/frames', async (req, res) => {
   }
 });
 
+// -------- /render (SÍNCRONO) --------
+// Responde con video/mp4 cuando termina (mantiene la conexión abierta).
 app.post('/render', async (req, res) => {
+  // Aumenta timeout de la respuesta para renders largos
+  res.setTimeout(RENDER_TIMEOUT_MS + 60_000);
   try {
     const {
       video_url, audio_url,
@@ -297,123 +248,15 @@ app.post('/render', async (req, res) => {
     if (!video_url || !audio_url)
       return res.status(400).json({ error: 'video_url and audio_url required' });
 
-    const id = enqueueRender({
-      video_url, audio_url, srt_url, bgm_url,
-      bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
-      bgm_offset_sec,
-    });
+    // ---- Paths temporales ----
+    const stamp = Date.now();
+    const inV = join(tmpdir(), `v_${stamp}.mp4`);
+    const inA = join(tmpdir(), `a_${stamp}.mp3`);
+    let srtPath = null;
+    let bgmPath = null;
+    const outPath = join(tmpdir(), `out_${stamp}.mp4`);
 
-    const base = getBase(req);
-    res.status(202).json({
-      id,
-      status_url: `${base}/render/${id}`,
-      video_url:  `${base}/render/${id}/video`,
-    });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-app.get('/render/:id', async (req, res) => {
-  const id = req.params.id;
-  const base = getBase(req);
-  const job = JOBS.get(id);
-
-  if (!job) {
-    const path = join(OUT_DIR, `${id}.mp4`);
-    try {
-      await access(path, FS_CONST.F_OK);
-      return res.json({ id, status: 'done', error: null, createdAt: null, updatedAt: null, doneAt: null, video_url: `${base}/render/${id}/video` });
-    } catch {
-      return res.status(404).json({ error: 'not found' });
-    }
-  }
-
-  const payload = {
-    id: job.id,
-    status: job.status,
-    error: job.error,
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-    doneAt: job.doneAt,
-  };
-  if (job.status === 'done') payload.video_url = `${base}/render/${id}/video`;
-  res.json(payload);
-});
-
-app.get('/render/:id/video', async (req, res) => {
-  const id = req.params.id;
-  const outPath = join(OUT_DIR, `${id}.mp4`);
-
-  const job = JOBS.get(id);
-  if (job) {
-    if (job.status === 'error')  return res.status(500).json({ error: job.error });
-    if (job.status !== 'done')   return res.status(425).json({ error: 'not ready' });
-  }
-
-  try {
-    const st = await stat(outPath);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', String(st.size));
-    res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
-    await pipeline(createReadStream(outPath), res);
-  } catch {
-    res.status(404).json({ error: 'not found' });
-  }
-});
-
-// =========================
-// Render real (con fallback de subtítulos)
-// =========================
-function buildVideoFilters({ srtPath, subsEnabled }) {
-  const vf = [];
-
-  if (MIRROR) vf.push('hflip');
-  if (PRE_ZOOM && PRE_ZOOM !== 1) vf.push(`crop=iw/${PRE_ZOOM}:ih/${PRE_ZOOM}`);
-  if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180:fillcolor=black`);
-  if (CONTRAST !== 1 || BRIGHTNESS !== 0 || SATURATION !== 1) {
-    vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
-  }
-  if (SHARPEN > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
-
-  vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase:flags=fast_bilinear`);
-  vf.push(`crop=${TARGET_W}:${TARGET_H}`);
-
-  if (subsEnabled && srtPath) {
-    const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
-    const ML = Math.round(TARGET_W * 0.04);
-    const MR = ML;
-    const MV = Math.round(TARGET_H * 0.05);
-    const style = [
-      `FontName=${SUBS_FONT}`,
-      `Fontsize=${FS}`,
-      'BorderStyle=1','Outline=0','Shadow=0',
-      'Alignment=2',
-      `MarginV=${MV}`, `MarginL=${ML}`, `MarginR=${MR}`,
-      'WrapStyle=0',
-    ].join(',');
-    vf.push(
-      `subtitles='${srtPath.replace(/\\/g,'/')}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
-    );
-  }
-
-  return vf.join(',');
-}
-
-async function doRenderOnce(job) {
-  const {
-    video_url, audio_url,
-    srt_url, bgm_url,
-    bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
-    bgm_offset_sec,
-  } = job.params;
-
-  const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
-  const inA = join(tmpdir(), `a_${Date.now()}.mp3`);
-  let srtPath = null, bgmPath = null;
-
-  try {
-    // Descargas
+    // ---- Descargas ----
     await downloadToFile(video_url, inV, {
       allowedCT: ['video','mp4','quicktime','x-matroska','octet-stream'],
       label: 'video_url',
@@ -423,15 +266,15 @@ async function doRenderOnce(job) {
       label: 'audio_url',
     });
     if (srt_url) {
-      srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
+      srtPath = join(tmpdir(), `subs_${stamp}.srt`);
       await downloadToFile(srt_url, srtPath, { allowedCT: ['srt','text','plain','octet-stream'], label: 'srt_url' });
     }
     if (bgm_url) {
-      bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
+      bgmPath = join(tmpdir(), `bgm_${stamp}.mp3`);
       await downloadToFile(bgm_url, bgmPath, { allowedCT: ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], label: 'bgm_url' });
     }
 
-    // AUDIO graph
+    // ---- AUDIO graph ----
     const BGM_VOL   = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
     const DUCK      = duck === undefined ? true : !!duck;
     const DUCK_T    = Number(duck_threshold ?? 0.1);
@@ -456,7 +299,7 @@ async function doRenderOnce(job) {
       aChain = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
     }
 
-    // SUBTÍTULOS habilitados?
+    // ---- SUBTÍTULOS habilitados? ----
     let subsEnabled = false;
     if (srtPath) {
       if (SUBS_MODE === 'on') subsEnabled = true;
@@ -464,13 +307,13 @@ async function doRenderOnce(job) {
       else subsEnabled = await hasSubtitlesFilter(); // auto
     }
 
-    // 1er intento (con subs si están habilitados)
+    // ---- 1er intento (con subs si están habilitados) ----
     let vf = buildVideoFilters({ srtPath, subsEnabled });
     let vChain = `[0:v]${vf}[vout]`;
     let filterComplex = [vChain, aChain].join(';');
 
     const baseArgs = [
-      '-y','-v','error',
+      '-y','-v','error','-nostdin',
       ...(HWACCEL ? ['-hwaccel', HWACCEL] : []),
       ...(LOOP_VIDEO ? ['-stream_loop','-1'] : []),
       '-i', inV,
@@ -480,60 +323,62 @@ async function doRenderOnce(job) {
       '-filter_threads', '0',
       '-map','[vout]','-map','[aout]',
       '-shortest',
+      // Video
       '-c:v', ENCODER,
       ...(ENCODER === 'libx264'
         ? ['-preset', PRESET, '-crf', String(CRF), '-x264-params', `keyint=${GOP}:min-keyint=${GOP}:scenecut=0`]
         : ['-g', String(GOP), '-b:v','0']),
+      // Audio
       '-c:a','aac','-b:a', AUDIO_BITRATE,
+      // Mux
       '-pix_fmt','yuv420p',
       '-movflags','+faststart',
       '-threads', String(THREADS),
       '-max_muxing_queue_size','1024',
-      job.outPath,
+      outPath,
     ];
 
     try {
       await runFfmpeg(baseArgs, RENDER_TIMEOUT_MS);
     } catch (e) {
-      // ¿falló por subtítulos? -> reintenta sin subtítulos
+      // Si falló por temas de subtítulos, reintenta sin ellos
       const msg = String(e.message || '');
       const looksLikeSubs =
         /No such filter:\s*'subtitles'|libass|Fontconfig|Could not find font|subtitles filter/i.test(msg);
 
       if (subsEnabled && looksLikeSubs) {
-        // reconstruir sin subtitles
         const vf2 = buildVideoFilters({ srtPath: null, subsEnabled: false });
         const vChain2 = `[0:v]${vf2}[vout]`;
         const fc2 = [vChain2, aChain].join(';');
         const args2 = [...baseArgs];
         const idx = args2.indexOf('-filter_complex');
-        if (idx !== -1) { args2[idx + 1] = fc2; }
+        if (idx !== -1) args2[idx + 1] = fc2;
 
-        // para diagnóstico más claro si vuelve a fallar
-        try { await runFfmpeg(args2, RENDER_TIMEOUT_MS); }
-        catch (e2) {
-          throw new Error(`ffmpeg (sin subtítulos) también falló.\nPrimero: ${msg.slice(0,800)}\nSegundo: ${String(e2.message).slice(0,800)}`);
-        }
+        await runFfmpeg(args2, RENDER_TIMEOUT_MS);
       } else {
-        // no parece ser problema de subtítulos -> propaga
         throw e;
       }
     }
 
-    // limpiar temporales
+    // ---- Enviar MP4 final (síncrono) ----
+    const st = await stat(outPath);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', String(st.size));
+    res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
+    await pipeline(createReadStream(outPath), res);
+
+    // ---- Limpieza ----
     try { await rm(inV, { force: true }); } catch {}
     try { await rm(inA, { force: true }); } catch {}
     try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
     try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
+    try { await rm(outPath, { force: true }); } catch {}
   } catch (err) {
-    try { await rm(inV, { force: true }); } catch {}
-    try { await rm(inA, { force: true }); } catch {}
-    try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
-    try { if (bgmPath) await rm(bgmPath, { force: true }); } catch {}
-    try { await rm(job.outPath, { force: true }); } catch {}
-    throw err;
+    if (!res.headersSent) {
+      res.status(500).json({ error: String(err) });
+    }
   }
-}
+});
 
 // =========================
 // Health
@@ -544,8 +389,13 @@ app.get('/health', (req, res) => {
 
 // ---------------- listen ----------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`ready on :${PORT} (/frames, /render [POST], /render/:id [GET], /render/:id/video [GET])`);
-  maybeRun();
+const server = app.listen(PORT, () => {
+  console.log(`ready on :${PORT} (/frames, /render [POST])`);
 });
-setInterval(maybeRun, 1000);
+
+// Eleva límites de tiempo del servidor para renders largos
+try {
+  server.requestTimeout = Math.max(server.requestTimeout ?? 0, RENDER_TIMEOUT_MS + 120_000);
+  server.headersTimeout = Math.max(server.headersTimeout ?? 0, RENDER_TIMEOUT_MS + 180_000);
+  server.keepAliveTimeout = Math.max(server.keepAliveTimeout ?? 0, 75_000);
+} catch {}
