@@ -43,6 +43,11 @@ const CRF = Number(process.env.CRF || 23);               // tamaño/calidad
 const AUDIO_BITRATE = process.env.AUDIO_BITRATE || '160k';
 const THREADS = Number(process.env.FFMPEG_THREADS || 0); // 0=auto
 
+// Encoder / GPU opcional
+const ENCODER = process.env.ENCODER || 'libx264';        // 'libx264' | 'h264_nvenc' | 'h264_qsv' | 'h264_vaapi'
+const HWACCEL = process.env.HWACCEL || '';               // ej: 'auto'
+const GOP = Number(process.env.GOP || 120);              // keyframe interval
+
 // =========================
 // Timeouts / Cola
 // =========================
@@ -59,7 +64,7 @@ const OUT_DIR = join(tmpdir(), 'renders_async_simple');
 await mkdir(OUT_DIR, { recursive: true });
 
 // =========================
-// Utilidades
+/** Utilidades **/
 // =========================
 const execFileP = promisify(execFile);
 
@@ -69,6 +74,24 @@ async function sh(cmd, args, opts = {}) {
     timeout: 0,
     ...opts,
   });
+}
+
+async function runFfmpeg(args, timeoutMs = RENDER_TIMEOUT_MS) {
+  try {
+    await execFileP('ffmpeg', args, {
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      env: { ...process.env },
+    });
+  } catch (err) {
+    const stderr = String(err.stderr || '');
+    const isOOMorTimeout =
+      err.killed || err.signal === 'SIGKILL' || err.code === 137 ||
+      /Killed|Out of memory|Cannot allocate|std::bad_alloc/i.test(stderr);
+    if (isOOMorTimeout) throw new Error('ffmpeg OOM/timeout. Baja resolución/preset o sube plan.');
+    throw new Error(`ffmpeg failed: ${(stderr || err.message || '').slice(0, 1200)}`);
+  }
 }
 
 function toNodeReadable(stream) {
@@ -248,10 +271,11 @@ app.post('/frames', async (req, res) => {
     } else {
       // fallback fps si no se pudo leer duración
       const outPattern = join(tmpdir(), `f_${Date.now()}-%03d.jpg`);
-      await sh('ffmpeg', [
+      await runFfmpeg([
         '-y','-v','error',
+        ...(HWACCEL ? ['-hwaccel', HWACCEL] : []),
         '-i', inFile,
-        '-vf', `fps=1/${FRAMES_EVERY_SEC},scale=${FRAMES_SCALE_W}:-2:flags=lanczos`,
+        '-vf', `fps=1/${FRAMES_EVERY_SEC},scale=${FRAMES_SCALE_W}:-2:flags=fast_bilinear`,
         '-frames:v', String(FRAMES_MAX),
         '-q:v', String(JPG_QUALITY),
         '-threads', String(THREADS),
@@ -273,12 +297,13 @@ app.post('/frames', async (req, res) => {
     const frames = [];
     for (const t of times) {
       const out = join(tmpdir(), `f_${t}_${Date.now()}.jpg`);
-      await sh('ffmpeg', [
+      await runFfmpeg([
         '-y','-v','error',
+        ...(HWACCEL ? ['-hwaccel', HWACCEL] : []),
         '-ss', String(t),
         '-i', inFile,
         '-frames:v','1',
-        '-vf', `scale=${FRAMES_SCALE_W}:-2:flags=lanczos`,
+        '-vf', `scale=${FRAMES_SCALE_W}:-2:flags=fast_bilinear`,
         '-q:v', String(JPG_QUALITY),
         '-threads', String(THREADS),
         out,
@@ -390,21 +415,23 @@ async function doRenderOnce(job) {
       });
     }
 
-    // Filtros de video
+    // Filtros de video (optimizado):
+    // - PRE_ZOOM como "crop" para no escalar antes (más rápido),
+    // - luego scale final + crop exacto al lienzo.
     const vf = [];
     if (MIRROR) vf.push('hflip');
-    if (PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
-    vf.push('crop=iw:ih');
-    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180`);
-    vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
+    if (PRE_ZOOM && PRE_ZOOM !== 1) vf.push(`crop=iw/${PRE_ZOOM}:ih/${PRE_ZOOM}`);
+    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180:fillcolor=black`);
+    if (CONTRAST !== 1 || BRIGHTNESS !== 0 || SATURATION !== 1) {
+      vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
+    }
     if (SHARPEN > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
-    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
+    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase:flags=fast_bilinear`);
     vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
     if (srtPath) {
       const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
-      const sidePct = 0.04;
-      const ML = Math.round(TARGET_W * sidePct);
+      const ML = Math.round(TARGET_W * 0.04);
       const MR = ML;
       const MV = Math.round(TARGET_H * 0.05);
       const style = [
@@ -428,27 +455,33 @@ async function doRenderOnce(job) {
       );
     }
 
-    // ffmpeg (simple: video + audio + opcional srt)
+    // ffmpeg (video + audio + opcional srt), con GPU opcional
     const args = [
       '-y','-v','error',
+      ...(HWACCEL ? ['-hwaccel', HWACCEL] : []),
       '-i', inV,
       '-i', inA,
       '-filter:v', vf.join(','),
       '-map','0:v:0',
       '-map','1:a:0',
       '-shortest',
-      '-c:v','libx264',
-      '-preset', PRESET,
-      '-crf', String(CRF),
-      '-c:a','aac',
-      '-b:a', AUDIO_BITRATE,
+      // Video
+      '-c:v', ENCODER,
+      ...(ENCODER === 'libx264'
+        ? ['-preset', PRESET, '-crf', String(CRF), '-x264-params', `keyint=${GOP}:min-keyint=${GOP}:scenecut=0`]
+        : ['-g', String(GOP), '-b:v', '0'] // nvenc/qsv/vaapi
+      ),
+      // Audio
+      '-c:a','aac','-b:a', AUDIO_BITRATE,
+      // Mux
       '-pix_fmt','yuv420p',
       '-movflags','+faststart',
       '-threads', String(THREADS),
-      job.outPath
+      '-max_muxing_queue_size','1024',
+      job.outPath,
     ];
 
-    await execFileP('ffmpeg', args, { timeout: RENDER_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
+    await runFfmpeg(args, RENDER_TIMEOUT_MS);
 
     // limpia temporales
     try { await rm(inV, { force: true }); } catch {}
