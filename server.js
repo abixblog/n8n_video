@@ -360,11 +360,11 @@ async function doRenderOnce(job) {
   } = job.params;
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
-  const inA = join(tmpdir(), `a_${Date.now()}.m4a`); // ElevenLabs suele dar m4a/aac; igual sirve para ffmpeg
+  const inA = join(tmpdir(), `a_${Date.now()}.mp3`);
   let srtPath = null, bgmPath = null;
 
   try {
-    // Descargas
+    // --- Descargas ---
     await downloadToFile(video_url, inV, {
       allowedCT: ['video','mp4','quicktime','x-matroska','octet-stream'],
       label: 'video_url',
@@ -375,53 +375,60 @@ async function doRenderOnce(job) {
     });
     if (srt_url) {
       srtPath = join(tmpdir(), `subs_${Date.now()}.srt`);
-      await downloadToFile(srt_url, srtPath, { allowedCT: ['srt','text','plain','octet-stream'], label: 'srt_url' });
+      await downloadToFile(srt_url, srtPath, {
+        allowedCT: ['srt','text','plain','octet-stream'],
+        label: 'srt_url',
+      });
     }
     if (bgm_url) {
       bgmPath = join(tmpdir(), `bgm_${Date.now()}.mp3`);
-      await downloadToFile(bgm_url, bgmPath, { allowedCT: ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'], label: 'bgm_url' });
+      await downloadToFile(bgm_url, bgmPath, {
+        allowedCT: ['audio','mpeg','mp3','aac','mp4','x-m4a','wav','x-wav','octet-stream'],
+        label: 'bgm_url',
+      });
     }
 
-    // ---- VIDEO FILTERS ----
+    // --- Duraciones ---
+    const dV   = await probeDuration(inV);         // seg
+    const dA   = await probeDuration(inA);         // seg (VO)  -> objetivo de salida
+    const dBGM = bgmPath ? await probeDuration(bgmPath) : 0;
+
+    // Duración objetivo (si no se pudo medir VO, no forzamos -t)
+    const TGT_T = Number.isFinite(dA) && dA > 0 ? dA + 0.5 : null;
+
+    // --- Filtros de video (rápidos) ---
     const vf = [];
     if (MIRROR) vf.push('hflip');
-    if (PRE_ZOOM && PRE_ZOOM !== 1) vf.push(`scale=iw*${PRE_ZOOM}:ih*${PRE_ZOOM}`);
-    vf.push('crop=iw:ih');
-    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180`);
+    if (PRE_ZOOM && PRE_ZOOM !== 1) vf.push(`crop=iw/${PRE_ZOOM}:ih/${PRE_ZOOM}`);
+    if (ROTATE_DEG) vf.push(`rotate=${ROTATE_DEG}*PI/180:fillcolor=black`);
     if (CONTRAST !== 1 || BRIGHTNESS !== 0 || SATURATION !== 1) {
       vf.push(`eq=contrast=${CONTRAST}:brightness=${BRIGHTNESS}:saturation=${SATURATION}`);
     }
     if (SHARPEN > 0) vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${SHARPEN}`);
-    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase`);
+    vf.push(`scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase:flags=fast_bilinear`);
     vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
     if (srtPath) {
       const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
-      const ML = Math.round(TARGET_W * 0.01);
+      const ML = Math.round(TARGET_W * 0.04);
       const MR = ML;
-      const MV = Math.round(TARGET_H * 0.06);
+      const MV = Math.round(TARGET_H * 0.05);
       const style = [
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
-        'Bold=1',
-        'BorderStyle=1',
-        'Outline=0',
-        'Shadow=0',
+        'BorderStyle=1','Outline=0','Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
         'Alignment=2',
-        `MarginV=${MV}`,
-        `MarginL=${ML}`,
-        `MarginR=${MR}`,
+        `MarginV=${MV}`, `MarginL=${ML}`, `MarginR=${MR}`,
         'WrapStyle=0',
       ].join(',');
       vf.push(
         `subtitles='${srtPath.replace(/\\/g,'/')}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
       );
     }
-
     const vChain = `[0:v]${vf.join(',')}[vout]`;
 
-    // ---- AUDIO (VO + BGM con ducking) ----
+    // --- Audio (VO + BGM con ducking) ---
     const BGM_VOL   = Math.max(0, Math.min(2, Number(bgm_volume ?? 0.16)));
     const DUCK      = duck === undefined ? true : !!duck;
     const DUCK_T    = Number(duck_threshold ?? 0.1);
@@ -435,61 +442,70 @@ async function doRenderOnce(job) {
     if (bgmPath) {
       const maybeDelay = BGM_OFF_MS ? `,adelay=${BGM_OFF_MS}|${BGM_OFF_MS}` : '';
       aChain = [
-        // Narración → estéreo 44.1k + duplicada (mix + sidechain)
-        `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
-          `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
-          `asplit=2[nar_mix][nar_side]`,
-        // BGM → estéreo 44.1k + volumen + offset (si aplica)
-        `[2:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
-          `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
-          `volume=${BGM_VOL}${maybeDelay}[bgm]`,
-        // Ducking usando la narración como sidechain
+        `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[nar_mix][nar_side]`,
+        `[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=${BGM_VOL}${maybeDelay}[bgm]`,
         DUCK
           ? `[bgm][nar_side]sidechaincompress=threshold=${DUCK_T}:ratio=${DUCK_R}:attack=${DUCK_A}:release=${DUCK_REL}[duck]`
           : `[bgm]anull[duck]`,
-        // Mezcla final (la duración final = la de la narración)
         `[nar_mix][duck]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
       ].join(';');
     } else {
-      // Sin BGM: solo normalizamos la narración
-      aChain =
-        `[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0,` +
-        `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+      aChain = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
     }
-
     const filterComplex = [vChain, aChain].join(';');
 
-    // ---- ffmpeg ----
-    const args = [
-      '-y','-v','error',
-      ...(HWACCEL ? ['-hwaccel', HWACCEL] : []),
-      // Repetimos VIDEO y BGM "infinitamente" para cubrir VO
-      '-stream_loop','-1','-i', inV,           // 0:v
-      '-i', inA,                               // 1:a Narración (VO)
-      ...(bgmPath ? ['-stream_loop','-1','-i', bgmPath] : []), // 2:a BGM (si hay)
+    // --- Inputs con loops FINITOS (no -1) y límite -t ---
+    const args = ['-y','-v','error'];
+    if (HWACCEL) args.push('-hwaccel', HWACCEL);
+
+    // VIDEO (idx 0)
+    // Si el audio es más largo y el video tiene duración conocida, repetimos lo justo:
+    if (LOOP_VIDEO && dA > 0 && dV > 0 && dA > dV) {
+      const loopsV = Math.max(0, Math.ceil(dA / dV) - 1);
+      if (loopsV > 0) args.push('-stream_loop', String(loopsV));
+    }
+    args.push('-i', inV);
+
+    // VO (idx 1)
+    args.push('-i', inA);
+
+    // BGM (idx 2)
+    if (bgmPath) {
+      if (process.env.LOOP_BGM !== 'false' && dA > 0 && dBGM > 0 && dA > dBGM) {
+        const loopsB = Math.max(0, Math.ceil(dA / dBGM) - 1);
+        if (loopsB > 0) args.push('-stream_loop', String(loopsB));
+      }
+      args.push('-i', bgmPath);
+    }
+
+    args.push(
       '-filter_complex', filterComplex,
+      '-filter_threads','0',
       '-map','[vout]','-map','[aout]',
-      // Recorta al terminar la narración (amix duration=first usa VO como referencia)
       '-shortest',
-      // Video
+      // video
       '-c:v', ENCODER,
       ...(ENCODER === 'libx264'
-          ? ['-preset', PRESET, '-crf', String(CRF), '-x264-params', `keyint=${GOP}:min-keyint=${GOP}:scenecut=0`]
-          : ['-g', String(GOP), '-b:v','0'] // nvenc/qsv/vaapi básico
+        ? ['-preset', PRESET, '-crf', String(CRF), '-x264-params', `keyint=${GOP}:min-keyint=${GOP}:scenecut=0`]
+        : ['-g', String(GOP), '-b:v', '0'] // nvenc/qsv/vaapi simple VBR
       ),
-      // Audio
+      // audio
       '-c:a','aac','-b:a', AUDIO_BITRATE,
-      // Mux
+      // mux
       '-pix_fmt','yuv420p',
       '-movflags','+faststart',
       '-threads', String(THREADS),
-      '-max_muxing_queue_size','1024',
-      job.outPath,
-    ];
+      '-max_muxing_queue_size','1024'
+    );
+
+    // Fuerza corte exacto al largo de la narración (si lo tenemos)
+    if (TGT_T) args.push('-t', String(Math.max(0.1, TGT_T)));
+
+    args.push(job.outPath);
 
     await runFfmpeg(args, RENDER_TIMEOUT_MS);
 
-    // limpiar temporales
+    // Limpieza
     try { await rm(inV, { force: true }); } catch {}
     try { await rm(inA, { force: true }); } catch {}
     try { if (srtPath) await rm(srtPath, { force: true }); } catch {}
