@@ -32,6 +32,7 @@ const CONTRAST   = Number(process.env.CONTRAST ?? 1.15);
 const BRIGHTNESS = Number(process.env.BRIGHTNESS ?? 0.05);
 const SATURATION = Number(process.env.SATURATION ?? 1.10);
 const SHARPEN    = Number(process.env.SHARPEN ?? 0);
+const LOOP_VIDEO = process.env.LOOP_VIDEO === 'false' ? false : true; // ✅ faltaba
 
 // Render (codec/velocidad)
 const ENCODER = process.env.ENCODER || 'libx264';     // libx264 | h264_nvenc | h264_qsv | h264_vaapi
@@ -133,6 +134,22 @@ function getBase(req) {
   const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0];
   const host  = (req.headers['x-forwarded-host']  || req.get('host'));
   return `${proto}://${host}`;
+}
+
+// ✅ Faltaba: probeDuration
+async function probeDuration(filePath) {
+  try {
+    const { stdout } = await execFileP('ffprobe', [
+      '-v','error',
+      '-show_entries','format=duration',
+      '-of','default=noprint_wrappers=1:nokey=1',
+      filePath
+    ]);
+    const d = parseFloat(String(stdout).trim());
+    return Number.isFinite(d) ? d : 0;
+  } catch {
+    return 0;
+  }
 }
 
 // =========================
@@ -239,7 +256,8 @@ app.post('/frames', async (req, res) => {
       '-y','-v','error',
       ...(HWACCEL ? ['-hwaccel', HWACCEL] : []),
       '-i', inFile,
-      '-vf', `fps=1/${FRAMES_EVERY_SEC},scale=${FRAMES_SCALE_W}:-2:flags=lanczos`,
+      // más rápido que lanczos:
+      '-vf', `fps=1/${FRAMES_EVERY_SEC},scale=${FRAMES_SCALE_W}:-2:flags=fast_bilinear`,
       '-frames:v', String(FRAMES_MAX),
       '-q:v', String(JPG_QUALITY),
       '-threads', String(THREADS),
@@ -263,7 +281,7 @@ app.post('/frames', async (req, res) => {
 });
 
 // -------- Render ASÍNCRONO --------
-// Body JSON esperado:
+// Body JSON:
 // {
 //   "video_url": "...", "audio_url": "...",
 //   "srt_url": "...? (opcional)",
@@ -459,7 +477,6 @@ async function doRenderOnce(job) {
     if (HWACCEL) args.push('-hwaccel', HWACCEL);
 
     // VIDEO (idx 0)
-    // Si el audio es más largo y el video tiene duración conocida, repetimos lo justo:
     if (LOOP_VIDEO && dA > 0 && dV > 0 && dA > dV) {
       const loopsV = Math.max(0, Math.ceil(dA / dV) - 1);
       if (loopsV > 0) args.push('-stream_loop', String(loopsV));
@@ -487,7 +504,7 @@ async function doRenderOnce(job) {
       '-c:v', ENCODER,
       ...(ENCODER === 'libx264'
         ? ['-preset', PRESET, '-crf', String(CRF), '-x264-params', `keyint=${GOP}:min-keyint=${GOP}:scenecut=0`]
-        : ['-g', String(GOP), '-b:v', '0'] // nvenc/qsv/vaapi simple VBR
+        : ['-g', String(GOP), '-b:v', '0'] // nvenc/qsv/vaapi
       ),
       // audio
       '-c:a','aac','-b:a', AUDIO_BITRATE,
@@ -498,7 +515,7 @@ async function doRenderOnce(job) {
       '-max_muxing_queue_size','1024'
     );
 
-    // Fuerza corte exacto al largo de la narración (si lo tenemos)
+    // Corte exacto al largo de la narración (si lo tenemos)
     if (TGT_T) args.push('-t', String(Math.max(0.1, TGT_T)));
 
     args.push(job.outPath);
