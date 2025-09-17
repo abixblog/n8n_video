@@ -431,12 +431,13 @@ async function doRenderOnce(job) {
 
     if (srtPath) {
       const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
-      const ML = Math.round(TARGET_W * 0.04);
+      const ML = Math.round(TARGET_W * 0.02);
       const MR = ML;
-      const MV = Math.round(TARGET_H * 0.05);
+      const MV = Math.round(TARGET_H * 0.08);
       const style = [
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
+        'Bold=1',
         'BorderStyle=1',
         'Outline=0',
         'Shadow=0',
