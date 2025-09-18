@@ -447,7 +447,7 @@ async function doRenderOnce(job) {
     vf.push(`crop=${TARGET_W}:${TARGET_H}`);
 
     if (srtPath) {
-      const FS = Math.max(6, Math.round(6 * (TARGET_H / 1080)));
+      const FS = Math.max(5, Math.round(5 * (TARGET_H / 1080)));
       const ML = Math.round(TARGET_W * 0.01);
       const MR = ML;
       const MV = Math.round(TARGET_H * 0.06);
