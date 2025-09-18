@@ -1,4 +1,4 @@
-// server.mjs  (Node 18+ con "type":"module" en package.json)
+// server.mjs  (Node 18+ con "type":"module" en package.json) 
 import express from 'express';
 import cors from 'cors';
 import { pipeline } from 'node:stream/promises';
@@ -32,7 +32,7 @@ const CONTRAST   = Number(process.env.CONTRAST ?? 1.15);
 const BRIGHTNESS = Number(process.env.BRIGHTNESS ?? 0.05);
 const SATURATION = Number(process.env.SATURATION ?? 1.10);
 const SHARPEN    = Number(process.env.SHARPEN ?? 0);
-const LOOP_VIDEO = process.env.LOOP_VIDEO === 'false' ? false : true; // ✅ faltaba
+const LOOP_VIDEO = process.env.LOOP_VIDEO === 'false' ? false : true;
 
 // Render (codec/velocidad)
 const ENCODER = process.env.ENCODER || 'libx264';     // libx264 | h264_nvenc | h264_qsv | h264_vaapi
@@ -136,7 +136,7 @@ function getBase(req) {
   return `${proto}://${host}`;
 }
 
-// ✅ Faltaba: probeDuration
+// ✅ probeDuration
 async function probeDuration(filePath) {
   try {
     const { stdout } = await execFileP('ffprobe', [
@@ -150,6 +150,21 @@ async function probeDuration(filePath) {
   } catch {
     return 0;
   }
+}
+
+// Escapes seguros para filtros de ffmpeg
+function escapeFilterPath(p) {
+  // Usar forward slashes, y escapar caracteres especiales para filtros (no para shell)
+  return p
+    .replace(/\\/g, '/')   // windows -> posix
+    .replace(/:/g, '\\:')  // separador de campos en filtros
+    .replace(/'/g, "\\'")  // quote interna en filtros
+    .replace(/\[/g, '\\[')
+    .replace(/]/g, '\\]');
+}
+function escapeForceStyle(s) {
+  // Solo escapar comillas simples
+  return s.replace(/'/g, "\\'");
 }
 
 // =========================
@@ -287,7 +302,9 @@ app.post('/frames', async (req, res) => {
 //   "srt_url": "...? (opcional)",
 //   "bgm_url": "...? (opcional)",
 //   "bgm_volume": 0.16, "bgm_offset_sec": 0,
-//   "duck": true, "duck_threshold": 0.1, "duck_ratio": 8, "duck_attack_ms": 5, "duck_release_ms": 250
+//   "duck": true, "duck_threshold": 0.1, "duck_ratio": 8, "duck_attack_ms": 5, "duck_release_ms": 250,
+//   "vo_gain": 1.0,              // 🔊 NUEVO: multiplicador lineal VO
+//   "vo_db": 0                   // 🔊 NUEVO: alternativa en dB (prioridad si viene)
 // }
 app.post('/render', async (req, res) => {
   try {
@@ -296,6 +313,8 @@ app.post('/render', async (req, res) => {
       srt_url, bgm_url,
       bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
       bgm_offset_sec,
+      vo_gain,              // 🔊 NEW
+      vo_db,                // 🔊 NEW
     } = req.body || {};
 
     if (!video_url || !audio_url)
@@ -305,6 +324,7 @@ app.post('/render', async (req, res) => {
       video_url, audio_url, srt_url, bgm_url,
       bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
       bgm_offset_sec,
+      vo_gain, vo_db,       // 🔊 NEW
     });
 
     const base = getBase(req);
@@ -375,6 +395,8 @@ async function doRenderOnce(job) {
     srt_url, bgm_url,
     bgm_volume, duck, duck_threshold, duck_ratio, duck_attack_ms, duck_release_ms,
     bgm_offset_sec,
+    vo_gain,    // 🔊 NEW
+    vo_db,      // 🔊 NEW
   } = job.params;
 
   const inV = join(tmpdir(), `v_${Date.now()}.mp4`);
@@ -407,12 +429,10 @@ async function doRenderOnce(job) {
     }
 
     // --- Duraciones ---
-    const dV   = await probeDuration(inV);         // seg
-    const dA   = await probeDuration(inA);         // seg (VO)  -> objetivo de salida
+    const dV   = await probeDuration(inV);
+    const dA   = await probeDuration(inA);
     const dBGM = bgmPath ? await probeDuration(bgmPath) : 0;
-
-    // Duración objetivo (si no se pudo medir VO, no forzamos -t)
-    const TGT_T = Number.isFinite(dA) && dA > 0 ? dA + 0.5 : null;
+    const tgtCut = Number.isFinite(dA) && dA > 0 ? dA + 0.5 : null;
 
     // --- Filtros de video (rápidos) ---
     const vf = [];
@@ -435,14 +455,17 @@ async function doRenderOnce(job) {
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
         'Bold=1',
-        'BorderStyle=1','Outline=0','Shadow=0',
+        'BorderStyle=1','Outline=1','Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
+        'OutlineColour=&H000000&',
         'Alignment=2',
         `MarginV=${MV}`, `MarginL=${ML}`, `MarginR=${MR}`,
         'WrapStyle=0',
       ].join(',');
+      const styleEsc = escapeForceStyle(style);
+      const srtEsc   = escapeFilterPath(srtPath);
       vf.push(
-        `subtitles='${srtPath.replace(/\\/g,'/')}':original_size=${TARGET_W}x${TARGET_H}:force_style='${style}':charenc=UTF-8`
+        `subtitles=${srtEsc}:original_size=${TARGET_W}x${TARGET_H}:force_style='${styleEsc}':charenc=UTF-8`
       );
     }
     const vChain = `[0:v]${vf.join(',')}[vout]`;
@@ -457,11 +480,17 @@ async function doRenderOnce(job) {
     const BGM_OFF_S = Math.max(0, Number(bgm_offset_sec ?? 0));
     const BGM_OFF_MS = Math.round(BGM_OFF_S * 1000);
 
+    // 🔊 VO gain (lineal) o en dB
+    const VO_DB   = Number.isFinite(Number(vo_db)) ? Number(vo_db) : null;
+    let   VO_GAIN = Number.isFinite(Number(vo_gain)) ? Number(vo_gain) : 1.0;
+    if (VO_DB !== null) VO_GAIN = Math.pow(10, VO_DB / 20);
+    VO_GAIN = Math.max(0.01, Math.min(5.0, VO_GAIN));
+
     let aChain;
     if (bgmPath) {
       const maybeDelay = BGM_OFF_MS ? `,adelay=${BGM_OFF_MS}|${BGM_OFF_MS}` : '';
       aChain = [
-        `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[nar_mix][nar_side]`,
+        `[1:a]aresample=44100,volume=${VO_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[nar_mix][nar_side]`,
         `[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=${BGM_VOL}${maybeDelay}[bgm]`,
         DUCK
           ? `[bgm][nar_side]sidechaincompress=threshold=${DUCK_T}:ratio=${DUCK_R}:attack=${DUCK_A}:release=${DUCK_REL}[duck]`
@@ -469,11 +498,11 @@ async function doRenderOnce(job) {
         `[nar_mix][duck]amix=inputs=2:duration=first:dropout_transition=200[aout]`,
       ].join(';');
     } else {
-      aChain = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
+      aChain = `[1:a]aresample=44100,volume=${VO_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
     }
     const filterComplex = [vChain, aChain].join(';');
 
-    // --- Inputs con loops FINITOS (no -1) y límite -t ---
+    // --- Inputs con loops finitos y límites ---
     const args = ['-y','-v','error'];
     if (HWACCEL) args.push('-hwaccel', HWACCEL);
 
@@ -513,13 +542,15 @@ async function doRenderOnce(job) {
       '-pix_fmt','yuv420p',
       '-movflags','+faststart',
       '-threads', String(THREADS),
-      '-max_muxing_queue_size','1024'
+      '-max_muxing_queue_size','1024',
+      job.outPath
     );
 
     // Corte exacto al largo de la narración (si lo tenemos)
-    if (TGT_T) args.push('-t', String(Math.max(0.1, TGT_T)));
-
-    args.push(job.outPath);
+    if (tgtCut) {
+      // insertar justo antes del output
+      args.splice(args.length - 1, 0, '-t', String(Math.max(0.1, tgtCut)));
+    }
 
     await runFfmpeg(args, RENDER_TIMEOUT_MS);
 
