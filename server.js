@@ -455,7 +455,7 @@ async function doRenderOnce(job) {
         'FontName=DejaVu Sans',
         `Fontsize=${FS}`,
         'Bold=1',
-        'BorderStyle=1','Outline=1','Shadow=0',
+        'BorderStyle=1','Outline=0.5','Shadow=0',
         'PrimaryColour=&H00FFFFFF&',
         'OutlineColour=&H000000&',
         'Alignment=2',
